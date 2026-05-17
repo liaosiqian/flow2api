@@ -13,7 +13,6 @@ function getRecaptchaToken(action) {
                             .catch(err => window.postMessage({type: 'reCAPTCHA_error', reqId: '${reqId}', error: err.message}, '*'));
                     });
                 }
-                
                 if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
                     runCaptcha();
                 } else {
@@ -27,22 +26,17 @@ function getRecaptchaToken(action) {
                 window.postMessage({type: 'reCAPTCHA_error', reqId: '${reqId}', error: e.message}, '*');
             }
         `;
-        
         const listener = (event) => {
             if (event.source !== window || !event.data) return;
             if (event.data.reqId === reqId) {
                 window.removeEventListener("message", listener);
                 script.remove();
-                if (event.data.type === 'reCAPTCHA_result') {
-                    resolve(event.data.token);
-                } else {
-                    reject(new Error(event.data.error || "Unknown reCAPTCHA Error"));
-                }
+                if (event.data.type === 'reCAPTCHA_result') resolve(event.data.token);
+                else reject(new Error(event.data.error || "Unknown reCAPTCHA Error"));
             }
         };
         window.addEventListener("message", listener);
         document.documentElement.appendChild(script);
-        
         setTimeout(() => {
             window.removeEventListener("message", listener);
             script.remove();
@@ -57,7 +51,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         getRecaptchaToken(message.action)
             .then(token => sendResponse({status: "success", token: token}))
             .catch(err => sendResponse({status: "error", error: err.message}));
-        return true; 
+        return true;
     }
 });
 
+// === Service Worker Keepalive ===
+let _keepaliveErrors = 0;
+setInterval(() => {
+    chrome.runtime.sendMessage({ type: "ping" })
+        .then(() => { _keepaliveErrors = 0; })
+        .catch(() => {
+            _keepaliveErrors++;
+            if (_keepaliveErrors <= 3) {
+                console.log("[Flow2API] Keepalive ping failed (" + _keepaliveErrors + ")");
+            }
+        });
+}, 25000);

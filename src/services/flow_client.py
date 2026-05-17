@@ -20,6 +20,13 @@ try:
 except ImportError:
     httpx = None
 
+try:
+    from .extension_generation_service import ExtensionGenerationService
+    _ext_gen_service_available = True
+except ImportError:
+    _ext_gen_service_available = False
+
+
 
 class FlowClient:
     """VideoFX API客户端"""
@@ -472,8 +479,34 @@ class FlowClient:
         json_data: Dict[str, Any],
         at: str,
         timeout: int,
+        token_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """视频 API 加硬截止，避免 curl_cffi 底层偶发卡住导致整条请求悬挂。"""
+        """视频 API 加硬截止，支持 Generation Proxy 优先路径。"""
+        if config.extension_generation_enabled and _ext_gen_service_available:
+            import sys
+            print(f"[EXT-GEN-VIDEO] Attempting extension proxy for video: {url.split('/')[-1]}", flush=True, file=sys.stderr)
+            try:
+                ext_result = await self._try_extension_generation(
+                    url=url,
+                    method="POST",
+                    json_data=json_data,
+                    at_token=at,
+                    timeout=timeout + 10,
+                    token_id=token_id,
+                )
+                print(f"[EXT-GEN-VIDEO] Video request succeeded via extension proxy, keys={list(ext_result.keys()) if isinstance(ext_result, dict) else type(ext_result)}", flush=True, file=sys.stderr)
+                if isinstance(ext_result, dict):
+                    import json as _json
+                    print(f"[EXT-GEN-VIDEO] Raw keys: {list(ext_result.keys())}", flush=True, file=sys.stderr)
+                    if "media" in ext_result and "operations" not in ext_result:
+                        ext_result = self._convert_media_to_operations(ext_result)
+                        print(f"[EXT-GEN-VIDEO] Converted to operations format", flush=True, file=sys.stderr)
+                return ext_result
+            except Exception as ext_err:
+                import sys
+                print(f"[EXT-GEN-VIDEO] Extension proxy failed, falling back to curl_cffi: {ext_err}", flush=True, file=sys.stderr)
+                debug_logger.log_warning(f"[EXT-GEN-VIDEO] Extension proxy failed: {ext_err}")
+
         try:
             return await asyncio.wait_for(
                 self._make_request(
@@ -489,6 +522,25 @@ class FlowClient:
             )
         except asyncio.TimeoutError as exc:
             raise Exception(f"Flow video API request timed out after {timeout}s") from exc
+
+
+    @staticmethod
+    def _convert_media_to_operations(resp: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert browser API media format to operations format expected by generation handler."""
+        media_list = resp.get("media", [])
+        operations = []
+        for m in media_list:
+            metadata = m.get("mediaMetadata", {})
+            status = metadata.get("mediaStatus", {}).get("mediaGenerationStatus", "")
+            operations.append({
+                "operation": {"name": m.get("name", "")},
+                "sceneId": m.get("sceneId", ""),
+                "status": status,
+            })
+        result = {"operations": operations}
+        if "remainingCredits" in resp:
+            result["remainingCredits"] = resp["remainingCredits"]
+        return result
 
     async def _acquire_image_launch_gate(
         self,
@@ -514,14 +566,84 @@ class FlowClient:
         """保留接口形状，当前无需释放任何本地发车状态。"""
         return
 
+
+    async def _try_extension_generation(
+        self,
+        *,
+        url: str,
+        method: str = "POST",
+        json_data: dict = None,
+        at_token: str = None,
+        timeout: int = 60,
+        token_id: int = None,
+    ) -> dict:
+        """Attempt to execute a generation request via the Chrome extension proxy.
+        
+        Returns the parsed JSON response if successful.
+        Raises RuntimeError if extension generation is not available or fails.
+        """
+        if not _ext_gen_service_available:
+            raise RuntimeError("ExtensionGenerationService not available")
+        if not config.extension_generation_enabled:
+            raise RuntimeError("Extension generation not enabled")
+
+        from .browser_captcha_extension import ExtensionCaptchaService
+        svc = await ExtensionCaptchaService.get_instance(self.db)
+        if not svc.active_connections:
+            raise RuntimeError("No active extension connections")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if at_token:
+            headers["authorization"] = f"Bearer {at_token}"
+
+        ext_svc = ExtensionGenerationService(db=self.db)
+        return await ext_svc.submit_generation(
+            url=url,
+            method=method,
+            headers=headers,
+            json_data=json_data,
+            timeout_seconds=timeout,
+            token_id=token_id,
+        )
+
     async def _make_image_generation_request(
         self,
         url: str,
         json_data: Dict[str, Any],
         at: str,
-        attempt_trace: Optional[Dict[str, Any]] = None
+        attempt_trace: Optional[Dict[str, Any]] = None,
+        token_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """图片生成请求使用更短超时，并在网络超时时快速重试。"""
+        """图片生成请求使用更短超时，并在网络超时时快速重试。
+        When extension_generation_enabled is True, attempts to route through Chrome extension first."""
+        # === Extension Generation Proxy (priority path) ===
+        import sys; print(f"[EXT-GEN-DEBUG] extension_generation_enabled={config.extension_generation_enabled}, _ext_gen_service_available={_ext_gen_service_available}", flush=True, file=sys.stderr)
+        if config.extension_generation_enabled and _ext_gen_service_available:
+            print("[EXT-GEN-DEBUG] Attempting extension proxy...", flush=True, file=sys.stderr)
+            try:
+                ext_result = await self._try_extension_generation(
+                    url=url,
+                    method="POST",
+                    json_data=json_data,
+                    at_token=at,
+                    timeout=config.flow_image_request_timeout + 10,
+                    token_id=token_id,
+                )
+                if isinstance(attempt_trace, dict):
+                    attempt_trace["via_extension_proxy"] = True
+                debug_logger.log_info("[EXT-GEN] Image generation request succeeded via extension proxy")
+                return ext_result
+            except Exception as ext_err:
+                debug_logger.log_warning(
+                    f"[EXT-GEN] Extension proxy failed, falling back to curl_cffi: {ext_err}"
+                )
+                if isinstance(attempt_trace, dict):
+                    attempt_trace["extension_proxy_error"] = str(ext_err)[:200]
+        # === End Extension Generation Proxy ===
+
         request_timeout = config.flow_image_request_timeout
         total_attempts = max(1, config.flow_image_timeout_retry_count + 1)
         retry_delay = config.flow_image_timeout_retry_delay
@@ -1107,6 +1229,7 @@ class FlowClient:
                     json_data=json_data,
                     at=at,
                     attempt_trace=attempt_trace,
+                    token_id=token_id,
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)

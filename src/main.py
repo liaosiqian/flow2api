@@ -15,6 +15,7 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
+from .services.chrome_manager import ChromeManager
 from .api import routes, admin
 
 
@@ -140,6 +141,17 @@ async def lifespan(app: FastAPI):
         print("✓ File cache cleanup task disabled (timeout <= 0)")
     print(f"✓ 429 auto-unban task started (runs every hour)")
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
+
+    # Start Chrome manager for Extension Generation Proxy
+    chrome_mgr = None
+    if captcha_config.captcha_method == "extension":
+        try:
+            chrome_mgr = await ChromeManager.get_instance(db)
+            await chrome_mgr.start_with_monitor()
+            print("✓ Chrome manager started (extension generation proxy)")
+        except Exception as e:
+            print(f"⚠ Chrome manager failed to start: {e}")
+    
     print("=" * 60)
 
     yield
@@ -154,6 +166,10 @@ async def lifespan(app: FastAPI):
         await auto_unban_task_handle
     except asyncio.CancelledError:
         pass
+    # Stop Chrome manager
+    if chrome_mgr:
+        await chrome_mgr.stop()
+        print("✓ Chrome manager stopped")
     # Close browser if initialized
     if browser_service:
         await browser_service.close()
