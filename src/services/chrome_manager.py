@@ -1,15 +1,19 @@
 """Chrome process manager for Extension Generation Proxy.
 
 Manages Chrome lifecycle: auto-start, health check, auto-restart.
-Launches Chrome in non-headless mode WITHOUT automation markers
-to avoid bot detection by reCAPTCHA and Google services.
+Launches Chrome in non-headless mode WITHOUT automation markers.
+Supports multi-instance: one Chrome per token with isolated profiles.
 """
 
 import asyncio
+import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional, List, Dict
 
 from ..core.logger import debug_logger
@@ -22,13 +26,14 @@ class ChromeManager:
         "/usr/local/lib/python3.11/site-packages/playwright/driver/"
         "package/.local-browsers/chromium-1217/chrome-linux64/chrome"
     )
-    EXTENSION_PATH = "/app/extension_v2"
-    PROFILE_BASE_DIR = "/app/profiles"
-    DEFAULT_PROFILE = "/app/extension_profile"
+    EXTENSION_TEMPLATE = "/app/extension_v2"
+    PROFILE_BASE = Path("/app/profiles")
+    LEGACY_PROFILE = Path("/app/extension_profile")
     START_URL = "https://labs.google/fx/tools/flow"
 
     HEALTH_CHECK_INTERVAL = 30
     RESTART_DELAY = 5
+    STARTUP_WAIT = 3
 
     def __init__(self, db=None):
         self._db = db
@@ -42,18 +47,23 @@ class ChromeManager:
             cls._instance = cls(db)
         return cls._instance
 
-    def _build_chrome_args(self, user_data_dir: str) -> list:
+    @staticmethod
+    def _build_chrome_args(
+        extension_dir: str,
+        user_data_dir: str,
+        window_offset: int = 0,
+    ) -> list:
         """Build Chrome launch arguments with anti-detection flags."""
         display = os.environ.get("DISPLAY", ":99")
 
         args = [
-            self.CHROME_BINARY,
+            ChromeManager.CHROME_BINARY,
 
-            # Extension loading
-            f"--disable-extensions-except={self.EXTENSION_PATH}",
-            f"--load-extension={self.EXTENSION_PATH}",
+            # Extension loading (per-instance copy with baked routeKey)
+            f"--disable-extensions-except={extension_dir}",
+            f"--load-extension={extension_dir}",
 
-            # User data (persistent cookies/session)
+            # User data (persistent cookies/session per token)
             f"--user-data-dir={user_data_dir}",
 
             # Anti-detection: NO automation markers
@@ -63,7 +73,7 @@ class ChromeManager:
             # Environment
             f"--display={display}",
             "--window-size=1440,900",
-            "--window-position=0,0",
+            f"--window-position={window_offset * 50},{window_offset * 30}",
             "--lang=en-US",
 
             # Docker compatibility
@@ -86,18 +96,46 @@ class ChromeManager:
             "--disable-hang-monitor",
 
             # Start URL
-            self.START_URL,
+            ChromeManager.START_URL,
         ]
         return args
 
-    async def _get_token_emails(self) -> List[Dict]:
-        """Query token table to get email-to-id mapping."""
+    def _prepare_extension_copy(self, route_key: str, profile_dir: Path) -> Path:
+        """Create a per-token copy of the extension with routeKey baked in."""
+        ext_dir = profile_dir / "extension"
+
+        if not ext_dir.exists():
+            shutil.copytree(self.EXTENSION_TEMPLATE, ext_dir)
+
+        bg_file = ext_dir / "background.js"
+        if bg_file.exists():
+            content = bg_file.read_text()
+            content = re.sub(
+                r'routeKey:\s*"[^"]*"',
+                f'routeKey: "{route_key}"',
+                content,
+            )
+            content = re.sub(
+                r'clientLabel:\s*"[^"]*"',
+                f'clientLabel: "{route_key}"',
+                content,
+            )
+            bg_file.write_text(content)
+
+        return ext_dir
+
+    async def _get_active_tokens(self) -> List[Dict]:
+        """Query all active tokens from database."""
         if not self._db:
             return []
         try:
             tokens = await self._db.get_all_tokens()
             return [
-                {"id": t.id, "email": getattr(t, "email", None) or f"token_{t.id}"}
+                {
+                    "id": t.id,
+                    "email": getattr(t, "email", None) or f"token_{t.id}",
+                    "is_active": getattr(t, "is_active", True),
+                }
                 for t in tokens
                 if getattr(t, "is_active", True)
             ]
@@ -105,53 +143,101 @@ class ChromeManager:
             debug_logger.log_warning(f"[ChromeManager] Failed to query tokens: {e}")
             return []
 
-    async def start_with_monitor(self):
-        """Start Chrome instance(s) and begin health monitoring."""
-        self._should_run = True
+    def _get_profile_dir(self, token_id: int, email: str) -> Path:
+        """Get or create profile directory for a token."""
+        safe_name = re.sub(r'[^a-zA-Z0-9@._-]', '_', email)
+        profile_dir = self.PROFILE_BASE / f"token_{token_id}_{safe_name}"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "data").mkdir(exist_ok=True)
+        return profile_dir
 
-        tokens = await self._get_token_emails()
+    async def start_with_monitor(self):
+        """Start Chrome instance(s) for all active tokens."""
+        self._should_run = True
+        self.PROFILE_BASE.mkdir(parents=True, exist_ok=True)
+
+        tokens = await self._get_active_tokens()
 
         if not tokens:
-            instance = _ChromeInstance(
-                label="default",
-                user_data_dir=self.DEFAULT_PROFILE,
-                chrome_args_builder=self._build_chrome_args,
-            )
-            success = await instance.start()
-            if success:
-                self._instances["default"] = instance
-                print(
-                    f"[ChromeManager] Chrome started "
-                    f"(PID={instance.pid}, profile=default)"
-                )
-            else:
-                print("[ChromeManager] Failed to start Chrome (default profile)")
-        else:
-            token_info = tokens[0]
-            email = token_info["email"]
-            token_id = token_info["id"]
-            label = f"token_{token_id}"
+            print("[ChromeManager] No active tokens, starting with legacy profile")
+            route_key = "default"
+            ext_dir = self.EXTENSION_TEMPLATE
+            user_data_dir = str(self.LEGACY_PROFILE)
 
-            user_data_dir = self.DEFAULT_PROFILE
             instance = _ChromeInstance(
-                label=label,
+                label=route_key,
+                extension_dir=ext_dir,
                 user_data_dir=user_data_dir,
-                chrome_args_builder=self._build_chrome_args,
+                window_offset=0,
             )
             success = await instance.start()
             if success:
-                self._instances[label] = instance
+                self._instances[route_key] = instance
                 print(
                     f"[ChromeManager] Chrome started "
-                    f"(PID={instance.pid}, token_id={token_id}, "
-                    f"email={email})"
+                    f"(PID={instance.pid}, profile=legacy/default)"
                 )
-            else:
-                print(
-                    f"[ChromeManager] Failed to start Chrome "
-                    f"(token_id={token_id}, email={email})"
-                )
+        else:
+            for idx, token_info in enumerate(tokens):
+                token_id = token_info["id"]
+                email = token_info["email"]
+                route_key = f"token_{token_id}"
 
+                profile_dir = self._get_profile_dir(token_id, email)
+
+                # Migrate: if legacy profile exists and this is the first token,
+                # symlink or copy the data
+                data_dir = profile_dir / "data"
+                if (
+                    idx == 0
+                    and self.LEGACY_PROFILE.exists()
+                    and not any(data_dir.iterdir())
+                ):
+                    try:
+                        shutil.copytree(
+                            self.LEGACY_PROFILE,
+                            data_dir,
+                            dirs_exist_ok=True,
+                        )
+                        print(
+                            f"[ChromeManager] Migrated legacy profile to "
+                            f"{profile_dir.name}"
+                        )
+                    except Exception as e:
+                        debug_logger.log_warning(
+                            f"[ChromeManager] Legacy migration failed: {e}"
+                        )
+
+                ext_dir = self._prepare_extension_copy(route_key, profile_dir)
+
+                instance = _ChromeInstance(
+                    label=route_key,
+                    extension_dir=str(ext_dir),
+                    user_data_dir=str(data_dir),
+                    window_offset=idx,
+                )
+                success = await instance.start()
+                if success:
+                    self._instances[route_key] = instance
+                    # Auto-set extension_route_key in DB for routing
+                    await self._ensure_route_key_in_db(token_id, route_key)
+                    print(
+                        f"[ChromeManager] Chrome started "
+                        f"(PID={instance.pid}, {route_key}, "
+                        f"email={email})"
+                    )
+                else:
+                    print(
+                        f"[ChromeManager] Failed to start Chrome "
+                        f"({route_key}, email={email})"
+                    )
+
+                # Stagger startups to avoid resource contention
+                if idx < len(tokens) - 1:
+                    await asyncio.sleep(2)
+
+        total = len(self._instances)
+        print(f"[ChromeManager] Total running instances: {total}")
         self._monitor_task = asyncio.create_task(self._health_monitor())
 
     async def stop(self):
@@ -167,16 +253,27 @@ class ChromeManager:
 
         for label, instance in self._instances.items():
             await instance.stop()
-            print(f"[ChromeManager] Chrome stopped (label={label})")
 
+        count = len(self._instances)
         self._instances.clear()
+        print(f"[ChromeManager] All {count} Chrome instance(s) stopped")
+
+    async def _ensure_route_key_in_db(self, token_id: int, route_key: str):
+        """Ensure token's extension_route_key matches the Chrome instance label."""
+        if not self._db:
+            return
+        try:
+            await self._db.update_token(token_id, extension_route_key=route_key)
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[ChromeManager] Failed to set route_key for token {token_id}: {e}"
+            )
 
     async def _health_monitor(self):
         """Background task: check all Chrome instances and restart if crashed."""
         while self._should_run:
             try:
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
-
                 if not self._should_run:
                     break
 
@@ -189,11 +286,9 @@ class ChromeManager:
                             f"restarting in {self.RESTART_DELAY}s..."
                         )
                         debug_logger.log_warning(
-                            f"[ChromeManager] Chrome process died: {label}"
+                            f"[ChromeManager] Chrome died: {label}"
                         )
-
                         await asyncio.sleep(self.RESTART_DELAY)
-
                         if self._should_run:
                             success = await instance.start()
                             if success:
@@ -203,41 +298,47 @@ class ChromeManager:
                                 )
                             else:
                                 print(
-                                    f"[ChromeManager] Restart failed "
-                                    f"(label={label}), will retry next cycle"
+                                    f"[ChromeManager] Restart failed: {label}"
                                 )
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 debug_logger.log_warning(
-                    f"[ChromeManager] Health monitor error: {e}"
+                    f"[ChromeManager] Monitor error: {e}"
                 )
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
 
     @property
     def status(self) -> dict:
-        instances_status = {}
-        for label, inst in self._instances.items():
-            instances_status[label] = {
-                "running": inst.is_running(),
-                "pid": inst.pid,
-                "restart_count": inst.restart_count,
-                "uptime_seconds": inst.uptime_seconds,
-            }
         return {
             "total_instances": len(self._instances),
-            "instances": instances_status,
+            "instances": {
+                label: {
+                    "running": inst.is_running(),
+                    "pid": inst.pid,
+                    "restart_count": inst.restart_count,
+                    "uptime_seconds": inst.uptime_seconds,
+                }
+                for label, inst in self._instances.items()
+            },
         }
 
 
 class _ChromeInstance:
-    """Represents a single Chrome process."""
+    """A single Chrome process bound to one token."""
 
-    def __init__(self, label: str, user_data_dir: str, chrome_args_builder):
+    def __init__(
+        self,
+        label: str,
+        extension_dir: str,
+        user_data_dir: str,
+        window_offset: int = 0,
+    ):
         self.label = label
+        self.extension_dir = extension_dir
         self.user_data_dir = user_data_dir
-        self._build_args = chrome_args_builder
+        self.window_offset = window_offset
         self._process: Optional[subprocess.Popen] = None
         self._last_start_time: Optional[float] = None
         self.restart_count = 0
@@ -272,20 +373,23 @@ class _ChromeInstance:
         chrome_bin = ChromeManager.CHROME_BINARY
         if not os.path.exists(chrome_bin):
             debug_logger.log_warning(
-                f"[ChromeInstance:{self.label}] Binary not found: {chrome_bin}"
+                f"[Chrome:{self.label}] Binary not found: {chrome_bin}"
             )
             return False
 
-        ext_path = ChromeManager.EXTENSION_PATH
-        if not os.path.isdir(ext_path):
+        if not os.path.isdir(self.extension_dir):
             debug_logger.log_warning(
-                f"[ChromeInstance:{self.label}] Extension not found: {ext_path}"
+                f"[Chrome:{self.label}] Extension not found: {self.extension_dir}"
             )
             return False
 
         os.makedirs(self.user_data_dir, exist_ok=True)
 
-        args = self._build_args(self.user_data_dir)
+        args = ChromeManager._build_chrome_args(
+            extension_dir=self.extension_dir,
+            user_data_dir=self.user_data_dir,
+            window_offset=self.window_offset,
+        )
 
         try:
             self._process = subprocess.Popen(
@@ -297,24 +401,24 @@ class _ChromeInstance:
             self._last_start_time = time.time()
             self.restart_count += 1
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(ChromeManager.STARTUP_WAIT)
 
             if self.is_running():
                 debug_logger.log_info(
-                    f"[ChromeInstance:{self.label}] Started PID={self._process.pid}"
+                    f"[Chrome:{self.label}] Started PID={self._process.pid}"
                 )
                 return True
             else:
                 rc = self._process.returncode
                 debug_logger.log_warning(
-                    f"[ChromeInstance:{self.label}] Exited immediately code={rc}"
+                    f"[Chrome:{self.label}] Exited immediately code={rc}"
                 )
                 self._process = None
                 return False
 
         except Exception as e:
             debug_logger.log_warning(
-                f"[ChromeInstance:{self.label}] Start failed: {e}"
+                f"[Chrome:{self.label}] Start failed: {e}"
             )
             self._process = None
             return False
@@ -330,4 +434,5 @@ class _ChromeInstance:
                     self._process.wait(timeout=3)
             except (ProcessLookupError, OSError):
                 pass
+            debug_logger.log_info(f"[Chrome:{self.label}] Stopped")
         self._process = None
