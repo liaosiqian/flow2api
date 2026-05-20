@@ -1472,17 +1472,38 @@ class GenerationHandler:
                 )
 
             generate_started_at = time.time()
-            result, generation_session_id, upstream_trace = await self.flow_client.generate_image(
-                at=token.at,
-                project_id=project_id,
-                prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs,
-                token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
-                progress_callback=_image_progress_callback,
+            image_timeout = (
+                config.flow_image_request_timeout * max(1, config.flow_max_retries)
+                + config.flow_image_timeout_retry_delay * max(0, config.flow_max_retries - 1)
+                + 120
             )
+            image_timeout = max(90, min(300, image_timeout))
+            try:
+                result, generation_session_id, upstream_trace = await asyncio.wait_for(
+                    self.flow_client.generate_image(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_name=model_config["model_name"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        image_inputs=image_inputs,
+                        token_id=token.id,
+                        token_image_concurrency=token.image_concurrency,
+                        progress_callback=_image_progress_callback,
+                    ),
+                    timeout=image_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                timeout_msg = f"图片生成提交超时 ({int(image_timeout)}s)"
+                debug_logger.log_warning(f"[IMAGE] {timeout_msg}")
+                if image_trace is not None:
+                    image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
+                    image_trace["timeout_seconds"] = int(image_timeout)
+                self._mark_generation_failed(generation_result, timeout_msg)
+                if stream:
+                    yield self._create_stream_chunk(f"❌ {timeout_msg}\n")
+                yield self._create_error_response(timeout_msg, status_code=504)
+                return
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
                 image_trace["upstream_trace"] = upstream_trace

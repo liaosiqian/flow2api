@@ -364,20 +364,26 @@ class ExtensionCaptchaService:
         req_id = f"gen_req_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
         self.pending_generation_requests[req_id] = (future, conn.websocket)
+        safe_timeout = max(5, int(timeout or 30))
+        browser_timeout = max(5, safe_timeout - 2)
         message = {"type": message_type, "req_id": req_id, **request_payload}
+        message.setdefault("timeout_seconds", browser_timeout)
+        message.setdefault("timeout_ms", browser_timeout * 1000)
         try:
             debug_logger.log_info(
                 f"[EXT-GEN] Dispatching {message_type} via label={conn.client_label or '-'}, "
                 f"url={str(request_payload.get('url',''))[:80]}"
             )
             await conn.websocket.send_text(json.dumps(message))
-            result = await asyncio.wait_for(future, timeout=max(5, int(timeout or 30)))
+            result = await asyncio.wait_for(future, timeout=safe_timeout)
             if not isinstance(result, dict):
                 raise RuntimeError("Invalid extension generation response format")
             if result.get("status") == "success":
                 return result
             error_msg = str(result.get("error") or "Extension generation request failed")
             raise RuntimeError(error_msg)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Extension generation {message_type} timeout after {safe_timeout}s") from exc
         finally:
             self.pending_generation_requests.pop(req_id, None)
 
