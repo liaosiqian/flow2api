@@ -1077,6 +1077,13 @@ class GenerationHandler:
             "prompt": prompt_for_log,
             "has_images": images is not None and len(images) > 0,
         }
+        request_log_state.update({
+            "start_time": start_time,
+            "operation": request_operation,
+            "request_payload": request_payload,
+            "model": model,
+            "prompt": prompt_for_log,
+        })
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
         # 向用户展示开始信息
@@ -1213,6 +1220,7 @@ class GenerationHandler:
 
             # 5. 根据类型处理
             generation_pipeline_started_at = time.time()
+            request_log_state["generation_pipeline_started_at"] = generation_pipeline_started_at
             if generation_type == "image":
                 debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
                 async for chunk in self._handle_image_generation(
@@ -1558,6 +1566,12 @@ class GenerationHandler:
                                 response_state["generated_assets"]["upscaled_image"]["local_url"] = local_url
                                 response_state["generated_assets"]["upscaled_image"]["url"] = local_url
                                 self._mark_generation_succeeded(generation_result)
+                                await self._finalize_success_request_log(
+                                    request_log_state,
+                                    token_id=token.id,
+                                    response_state=response_state,
+                                    perf_trace=perf_trace,
+                                )
                                 if stream:
                                     yield self._create_stream_chunk(f"✅ {resolution_name} 图片缓存成功\n")
                                     yield self._create_stream_chunk(
@@ -1579,6 +1593,12 @@ class GenerationHandler:
                                 response_state["generated_assets"]["upscaled_image"]["url"] = image_url
                                 response_state["generated_assets"]["upscaled_image"]["delivery_mode"] = "inline_base64_fallback"
                                 self._mark_generation_succeeded(generation_result)
+                                await self._finalize_success_request_log(
+                                    request_log_state,
+                                    token_id=token.id,
+                                    response_state=response_state,
+                                    perf_trace=perf_trace,
+                                )
                                 base64_url = f"data:image/jpeg;base64,{encoded_image}"
                                 if stream:
                                     cache_error = self._normalize_error_message(e, max_length=120)
@@ -1656,6 +1676,12 @@ class GenerationHandler:
                 "final_image_url": local_url
             }
             self._mark_generation_succeeded(generation_result)
+            await self._finalize_success_request_log(
+                request_log_state,
+                token_id=token.id,
+                response_state=response_state,
+                perf_trace=perf_trace,
+            )
 
             if stream:
                 yield self._create_stream_chunk(
@@ -2175,6 +2201,12 @@ class GenerationHandler:
 
                     # 返回结果
                     self._mark_generation_succeeded(generation_result)
+                    await self._finalize_success_request_log(
+                        request_log_state,
+                        token_id=token.id,
+                        response_state=response_state,
+                        perf_trace=perf_trace,
+                    )
 
                     if stream:
                         yield self._create_stream_chunk(
@@ -2410,6 +2442,52 @@ class GenerationHandler:
             )
         except Exception as e:
             debug_logger.log_error(f"Failed to update request log progress: {e}")
+
+    async def _finalize_success_request_log(
+        self,
+        request_log_state: Optional[Dict[str, Any]],
+        *,
+        token_id: Optional[int],
+        response_state: Optional[Dict[str, Any]],
+        perf_trace: Optional[Dict[str, Any]],
+    ):
+        if not isinstance(request_log_state, dict):
+            return
+        if not request_log_state.get("id"):
+            return
+
+        start_time = float(request_log_state.get("start_time") or time.time())
+        duration = time.time() - start_time
+        if isinstance(perf_trace, dict):
+            pipeline_started_at = request_log_state.get("generation_pipeline_started_at")
+            if pipeline_started_at and "generation_pipeline_ms" not in perf_trace:
+                perf_trace["generation_pipeline_ms"] = int((time.time() - float(pipeline_started_at)) * 1000)
+            perf_trace["status"] = "success"
+            perf_trace["total_ms"] = int(duration * 1000)
+
+        response_data = {
+            "status": "success",
+            "model": request_log_state.get("model"),
+            "prompt": request_log_state.get("prompt"),
+            "performance": perf_trace or {},
+        }
+        if isinstance(response_state, dict):
+            if response_state.get("url"):
+                response_data["url"] = response_state["url"]
+            if response_state.get("generated_assets"):
+                response_data["generated_assets"] = response_state["generated_assets"]
+
+        await self._log_request(
+            token_id,
+            request_log_state.get("operation") or "generate_unknown",
+            request_log_state.get("request_payload") or {},
+            response_data,
+            200,
+            duration,
+            log_id=request_log_state.get("id"),
+            status_text="completed",
+            progress=100,
+        )
 
     async def _log_request(
         self,
