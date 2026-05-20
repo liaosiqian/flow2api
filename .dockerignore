@@ -50,6 +50,8 @@ data/*.db
 data/*.db-journal
 tmp/*
 .tmp-*/
+browser_profiles/
+warp-data/
 logs/*
 *.log
 
