@@ -53,6 +53,8 @@ logs.txt
 *.tmp
 *.bak
 *.cache
+.tmp-*/
+.pytest_cache/
 
 browser_data
 browser_data_rt

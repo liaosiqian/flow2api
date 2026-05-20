@@ -1,5 +1,6 @@
 """API routes for OpenAI-compatible and Gemini generateContent endpoints."""
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import base64
@@ -22,6 +23,12 @@ from ..core.models import (
     GeminiGenerateContentRequest,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
+from ..services.async_task_manager import (
+    AsyncTaskManager,
+    QueueFullError,
+    MediaIdExpiredError,
+    infer_task_type,
+)
 from ..services.browser_captcha_extension import ExtensionCaptchaService
 
 router = APIRouter()
@@ -69,6 +76,7 @@ GEMINI_STATUS_MAP = {
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+async_task_manager: AsyncTaskManager = None
 
 
 @dataclass
@@ -86,6 +94,11 @@ def set_generation_handler(handler: GenerationHandler):
     """Set generation handler instance."""
     global generation_handler
     generation_handler = handler
+
+
+def set_async_task_manager(manager: AsyncTaskManager):
+    global async_task_manager
+    async_task_manager = manager
 
 
 def _ensure_generation_handler() -> GenerationHandler:
@@ -852,6 +865,7 @@ async def create_chat_completion(
     request: ChatCompletionRequest,
     raw_request: Request,
     api_key: str = Depends(verify_api_key_flexible),
+    async_mode: Optional[str] = Query(None, alias="async"),
 ):
     """OpenAI-compatible unified generation endpoint."""
     try:
@@ -860,6 +874,9 @@ async def create_chat_completion(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
+
+        if async_mode and async_mode.lower() == "true":
+            return await _handle_async_submit(normalized, request_base_url)
 
         if request.stream:
             return StreamingResponse(
@@ -896,6 +913,7 @@ async def generate_content(
     request: GeminiGenerateContentRequest,
     raw_request: Request,
     api_key: str = Depends(verify_api_key_flexible),
+    async_mode: Optional[str] = Query(None, alias="async"),
 ):
     """Gemini official generateContent endpoint."""
     try:
@@ -904,6 +922,9 @@ async def generate_content(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
+
+        if async_mode and async_mode.lower() == "true":
+            return await _handle_async_submit(normalized, request_base_url)
 
         payload = _enrich_payload_with_direct_url(
             _parse_handler_result(
@@ -971,6 +992,112 @@ async def stream_generate_content(
             status_code=500,
             content=_build_gemini_error_payload(500, str(exc)),
         )
+
+async def _handle_async_submit(
+    normalized: NormalizedGenerationRequest,
+    base_url_override: Optional[str],
+) -> JSONResponse:
+    if async_task_manager is None:
+        raise HTTPException(status_code=500, detail="Async task manager not initialized")
+
+    model_config = MODEL_CONFIG.get(normalized.model)
+    if not model_config:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {normalized.model}")
+
+    task_type = infer_task_type(normalized.model, model_config)
+
+    try:
+        task = async_task_manager.submit(task_type)
+    except QueueFullError as exc:
+        return JSONResponse(
+            status_code=429,
+            content={"success": False, "error": str(exc)},
+        )
+
+    async_task_manager.start_execution(
+        task=task,
+        model=normalized.model,
+        prompt=normalized.prompt,
+        images=normalized.images if normalized.images else None,
+        base_url_override=base_url_override,
+        video_media_id=normalized.video_media_id,
+    )
+
+    return JSONResponse(content=task.to_submit_response())
+
+
+@router.get("/v1/generation/status")
+async def get_generation_status(
+    task_id: str = Query(...),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    if async_task_manager is None:
+        raise HTTPException(status_code=500, detail="Async task manager not initialized")
+
+    task = async_task_manager.get_task(task_id)
+    if not task:
+        return JSONResponse(content={
+            "success": True,
+            "task_id": task_id,
+            "status": "not_found",
+            "error": "Task not found or expired",
+        })
+
+    return JSONResponse(content=task.to_status_response())
+
+
+@router.get("/v1/generation/list")
+async def list_generation_tasks(
+    limit: int = Query(20, ge=1, le=100),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    if async_task_manager is None:
+        raise HTTPException(status_code=500, detail="Async task manager not initialized")
+
+    tasks = async_task_manager.list_tasks(limit=limit)
+    return JSONResponse(content={
+        "success": True,
+        "tasks": [t.to_list_item() for t in tasks],
+    })
+
+
+@router.post("/v1/generation/upsample")
+async def submit_upsample(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    if async_task_manager is None:
+        raise HTTPException(status_code=500, detail="Async task manager not initialized")
+
+    body = await raw_request.json()
+    media_id = body.get("media_id")
+    resolution = body.get("resolution", "UPSAMPLE_IMAGE_RESOLUTION_4K")
+    base_url = body.get("base_url")
+
+    if not media_id:
+        raise HTTPException(status_code=400, detail="media_id is required")
+
+    ctx = async_task_manager.get_media_context(media_id)
+    if ctx is None:
+        raise HTTPException(status_code=404, detail="media_id not found or expired (2h TTL)")
+
+    try:
+        task = async_task_manager.submit("image_upsample")
+    except QueueFullError:
+        raise HTTPException(status_code=429, detail="Task queue full (max 10)")
+
+    asyncio.create_task(
+        async_task_manager.execute_upsample(task, media_id, resolution, base_url)
+    )
+
+    return JSONResponse(content={
+        "success": True,
+        "task_id": task.task_id,
+        "type": "image_upsample",
+        "status": task.status,
+        "created_at": task.created_at.isoformat() + "Z",
+    })
+
 
 @router.websocket("/captcha_ws")
 async def captcha_websocket_endpoint(websocket: WebSocket):

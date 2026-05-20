@@ -44,6 +44,10 @@ if [ "${ALLOW_DOCKER_HEADED_CAPTCHA:-true}" = "true" ] || [ "${ALLOW_DOCKER_HEAD
 
     echo "[entrypoint] starting Fluxbox on DISPLAY=${DISPLAY}"
     fluxbox >/tmp/fluxbox.log 2>&1 &
+
+    echo "[entrypoint] starting x11vnc + noVNC on port 6080"
+    x11vnc -display "${DISPLAY}" -forever -shared -nopw -rfbport 5900 -bg -o /tmp/x11vnc.log 2>&1
+    websockify --web /usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
 fi
 
 echo "[entrypoint] starting flow2api (headed browser mode)"

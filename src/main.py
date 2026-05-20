@@ -15,6 +15,8 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
+from .services.chrome_manager import ChromeManager
+from .services.async_task_manager import AsyncTaskManager
 from .api import routes, admin
 
 
@@ -140,7 +142,26 @@ async def lifespan(app: FastAPI):
         print("✓ File cache cleanup task disabled (timeout <= 0)")
     print(f"✓ 429 auto-unban task started (runs every hour)")
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
+
+    # Start Chrome manager for Extension Generation Proxy
+    chrome_mgr = None
+    if captcha_config.captcha_method == "extension":
+        try:
+            chrome_mgr = await ChromeManager.get_instance(db)
+            await chrome_mgr.start_with_monitor()
+            print("✓ Chrome manager started (extension generation proxy)")
+        except Exception as e:
+            print(f"⚠ Chrome manager failed to start: {e}")
+
+    # Start proactive AT refresh background task
+    token_manager.start_proactive_refresh()
+    print(f"✓ AT proactive refresh task started (every 10 min, ST margin 4h, AT margin 2h)")
+
     print("=" * 60)
+
+    # Start async task manager
+    await async_task_manager.start()
+    print("✓ Async task manager started")
 
     yield
 
@@ -148,12 +169,21 @@ async def lifespan(app: FastAPI):
     print("Flow2API Shutting down...")
     # Stop file cache cleanup task
     await generation_handler.file_cache.stop_cleanup_task()
+    # Stop proactive AT refresh
+    token_manager.stop_proactive_refresh()
     # Stop auto-unban task
     auto_unban_task_handle.cancel()
     try:
         await auto_unban_task_handle
     except asyncio.CancelledError:
         pass
+    # Stop Chrome manager
+    if chrome_mgr:
+        await chrome_mgr.stop()
+        print("✓ Chrome manager stopped")
+    # Stop async task manager
+    await async_task_manager.stop()
+    print("✓ Async task manager stopped")
     # Close browser if initialized
     if browser_service:
         await browser_service.close()
@@ -178,8 +208,18 @@ generation_handler = GenerationHandler(
     proxy_manager  # 添加 proxy_manager 参数
 )
 
+# Async task manager
+async_task_manager = AsyncTaskManager(
+    generation_handler=generation_handler,
+    flow_client=flow_client,
+    token_manager=token_manager,
+    load_balancer=load_balancer,
+    db=db,
+)
+
 # Set dependencies
 routes.set_generation_handler(generation_handler)
+routes.set_async_task_manager(async_task_manager)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
 
 # Create FastAPI app

@@ -1993,7 +1993,7 @@ class GenerationHandler:
             await asyncio.sleep(poll_interval)
 
             try:
-                result = await self.flow_client.check_video_status(token.at, operations)
+                result = await self.flow_client.check_video_status(token.at, operations, token_id=token.id)
                 checked_operations = result.get("operations", [])
                 consecutive_poll_errors = 0
                 last_poll_error = None

@@ -11,6 +11,11 @@ from .flow_client import FlowClient
 from .proxy_manager import ProxyManager
 
 
+PROACTIVE_REFRESH_INTERVAL = 600   # 每 10 分钟扫一次
+PROACTIVE_AT_REFRESH_MARGIN = 7200   # AT/session 到期前 2 小时就主动刷新 AT
+PROACTIVE_ST_REFRESH_MARGIN = 14400  # session 到期前 4 小时主动走 OAuth 重认证获取新 session
+
+
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
@@ -22,6 +27,7 @@ class TokenManager:
         self._refresh_locks: dict[int, asyncio.Lock] = {}
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._refresh_futures: dict[int, asyncio.Task] = {}
+        self._proactive_refresh_task: Optional[asyncio.Task] = None
 
     async def _get_token_lock(
         self,
@@ -433,6 +439,91 @@ class TokenManager:
         valid_token = await self.ensure_valid_token(token_obj)
         return valid_token is not None
 
+    # ========== 后台主动刷新 (proactive) ==========
+
+    def start_proactive_refresh(self):
+        """启动后台定时刷新循环，应在应用 startup 时调用。"""
+        if self._proactive_refresh_task and not self._proactive_refresh_task.done():
+            return
+        self._proactive_refresh_task = asyncio.create_task(self._proactive_refresh_loop())
+        debug_logger.log_info("[PROACTIVE_REFRESH] 后台 AT 主动刷新已启动")
+
+    def stop_proactive_refresh(self):
+        """停止后台定时刷新。"""
+        if self._proactive_refresh_task and not self._proactive_refresh_task.done():
+            self._proactive_refresh_task.cancel()
+            debug_logger.log_info("[PROACTIVE_REFRESH] 后台 AT 主动刷新已停止")
+
+    async def _proactive_refresh_loop(self):
+        """每 PROACTIVE_REFRESH_INTERVAL 秒扫描一次，主动刷新即将过期的 token。
+
+        两级策略：
+        - session 剩余 < 4h: 走扩展通道 OAuth 重认证获取全新 session (~16h)
+        - session 剩余 < 2h: 刷新 AT（fallback 到 ST 刷新）
+        """
+        import sys
+        await asyncio.sleep(30)
+        while True:
+            try:
+                tokens = await self.get_active_tokens()
+                now = datetime.now(timezone.utc)
+                refreshed = 0
+                for token in tokens:
+                    if not token.at_expires:
+                        continue
+                    at_exp = token.at_expires
+                    if at_exp.tzinfo is None:
+                        at_exp = at_exp.replace(tzinfo=timezone.utc)
+                    remaining = (at_exp - now).total_seconds()
+
+                    if remaining < PROACTIVE_ST_REFRESH_MARGIN:
+                        remaining_h = remaining / 3600
+                        msg = (
+                            f"[PROACTIVE_REFRESH] Token {token.id} ({token.email}): "
+                            f"session 剩余 {remaining_h:.1f}h (< {PROACTIVE_ST_REFRESH_MARGIN // 3600}h)，"
+                            f"主动触发 ST 刷新获取新 session"
+                        )
+                        debug_logger.log_info(msg)
+                        print(msg, flush=True, file=sys.stderr)
+
+                        new_st = await self._try_refresh_st(token.id, token)
+                        if new_st:
+                            ok = await self._do_refresh_at(token.id, new_st)
+                            status = "成功" if ok else "AT刷新失败"
+                        else:
+                            ok = await self._refresh_at(token.id)
+                            status = "AT刷新成功(ST刷新失败)" if ok else "全部失败"
+
+                        result_msg = f"[PROACTIVE_REFRESH] Token {token.id}: {status}"
+                        debug_logger.log_info(result_msg)
+                        print(result_msg, flush=True, file=sys.stderr)
+                        refreshed += 1
+
+                    elif remaining < PROACTIVE_AT_REFRESH_MARGIN:
+                        msg = (
+                            f"[PROACTIVE_REFRESH] Token {token.id} ({token.email}): "
+                            f"AT 剩余 {remaining:.0f}s (< {PROACTIVE_AT_REFRESH_MARGIN}s)，主动刷新 AT"
+                        )
+                        debug_logger.log_info(msg)
+                        print(msg, flush=True, file=sys.stderr)
+                        ok = await self._refresh_at(token.id)
+                        status = "成功" if ok else "失败"
+                        result_msg = f"[PROACTIVE_REFRESH] Token {token.id}: AT 刷新{status}"
+                        debug_logger.log_info(result_msg)
+                        print(result_msg, flush=True, file=sys.stderr)
+                        refreshed += 1
+
+                if refreshed > 0:
+                    msg = f"[PROACTIVE_REFRESH] 本轮刷新 {refreshed} 个 token"
+                    debug_logger.log_info(msg)
+                    print(msg, flush=True, file=sys.stderr)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                err_msg = f"[PROACTIVE_REFRESH] 扫描异常: {e}"
+                debug_logger.log_error(err_msg)
+                print(err_msg, flush=True, file=sys.stderr)
+            await asyncio.sleep(PROACTIVE_REFRESH_INTERVAL)
 
     async def _refresh_at_inner(self, token_id: int) -> bool:
         """Perform exactly one real AT refresh attempt."""
@@ -545,64 +636,195 @@ class TokenManager:
             record_token_refresh("at", "failure")
             return False
 
+    async def _extract_st_from_chrome_cookies(self, token_id: int, email: str) -> Optional[str]:
+        """从 Chrome cookie 数据库直接提取 session token。
+
+        Chrome 访问 labs.google 时自动续签 session cookie，但不会同步到
+        flow2api 数据库。此方法直接读取浏览器的最新 cookie 作为优先刷新源。
+        """
+        import re as _re
+        import sqlite3
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        safe_name = _re.sub(r'[^a-zA-Z0-9@._-]', '_', email)
+        cookie_db = Path(f"/app/profiles/token_{token_id}_{safe_name}/data/Default/Cookies")
+
+        if not cookie_db.exists():
+            debug_logger.log_info(f"[CHROME_COOKIE] Token {token_id}: cookie DB not found at {cookie_db}")
+            return None
+
+        tmp = None
+        try:
+            tmp = tempfile.mktemp(suffix=".db")
+            shutil.copy2(str(cookie_db), tmp)
+
+            conn = sqlite3.connect(tmp)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT encrypted_value FROM cookies "
+                "WHERE host_key LIKE ? AND name LIKE ?",
+                ("%labs.google%", "%session%"),
+            )
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row or not row[0]:
+                debug_logger.log_info(f"[CHROME_COOKIE] Token {token_id}: session cookie not found in DB")
+                return None
+
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.backends import default_backend
+
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA1(), length=16,
+                salt=b"saltysalt", iterations=1,
+                backend=default_backend(),
+            )
+            key = kdf.derive(b"peanuts")
+
+            enc_val = row[0]
+            iv = b"\x00" * 16
+            cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+            d = cipher.decryptor()
+            dec = d.update(enc_val[3:]) + d.finalize()
+            dec = dec[: -dec[-1]]
+            text = dec.decode("utf-8", errors="replace")
+
+            idx = text.find("eyJ")
+            if idx < 0:
+                debug_logger.log_warning(f"[CHROME_COOKIE] Token {token_id}: decrypted cookie has no JWT")
+                return None
+
+            st = text[idx:]
+            debug_logger.log_info(
+                f"[CHROME_COOKIE] Token {token_id}: extracted ST from Chrome cookie DB ({len(st)} chars)"
+            )
+            return st
+
+        except ImportError:
+            debug_logger.log_warning(
+                f"[CHROME_COOKIE] Token {token_id}: cryptography package not installed, skipping cookie extraction"
+            )
+            return None
+        except Exception as e:
+            debug_logger.log_warning(f"[CHROME_COOKIE] Token {token_id}: extraction failed - {e}")
+            return None
+        finally:
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
+
     async def _try_refresh_st(self, token_id: int, token) -> Optional[str]:
-        """尝试通过浏览器刷新 Session Token
+        """尝试刷新 Session Token。
 
-        使用常驻 tab 获取新的 __Secure-next-auth.session-token
-
-        Args:
-            token_id: Token ID
-            token: Token 对象
-
-        Returns:
-            新的 ST 字符串，如果失败返回 None
+        四级策略：
+        1. 优先从 Chrome cookie DB 直接提取（最可靠，无需 Google 交互）
+        2. extension 模式先模拟真人打开/刷新 Labs 页面，让 NextAuth 自然续签 session
+        3. personal 模式使用常驻 tab
+        4. extension 模式最后通过 WebSocket 通道触发 OAuth 重认证
         """
         try:
+            chrome_st = await self._extract_st_from_chrome_cookies(token_id, token.email)
+            if chrome_st and chrome_st != token.st:
+                debug_logger.log_info(
+                    f"[ST_REFRESH] Token {token_id}: found newer ST in Chrome cookie DB"
+                )
+                return await self._validate_and_save_st(token_id, token, chrome_st)
+
             from ..core.config import config
 
-            # 仅在 personal 模式下支持 ST 自动刷新
-            if config.captcha_method != "personal":
-                debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
-                return None
+            if config.captcha_method == "personal":
+                return await self._refresh_st_personal(token_id, token)
 
-            if not token.current_project_id:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id} 没有 project_id，无法刷新 ST")
-                return None
+            natural_st = await self._refresh_st_naturally_via_extension(token_id, token)
+            if natural_st:
+                return natural_st
 
-            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST...")
-
-            from .browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
-
-            refresh_timeout_seconds = 45.0
-            try:
-                new_st = await asyncio.wait_for(
-                    service.refresh_session_token(token.current_project_id),
-                    timeout=refresh_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                debug_logger.log_error(
-                    f"[ST_REFRESH] Token {token_id}: 刷新 ST 超时 ({refresh_timeout_seconds:.0f}s)"
-                )
-                record_token_refresh("st", "failure")
-                return None
-            if new_st and new_st != token.st:
-                # 更新数据库中的 ST
-                await self.db.update_token(token_id, st=new_st)
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST 已自动更新")
-                record_token_refresh("st", "success")
-                return new_st
-            elif new_st == token.st:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 获取到的 ST 与原 ST 相同，可能登录已失效")
-                record_token_refresh("st", "failure")
-                return None
-            else:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 无法获取新 ST")
-                record_token_refresh("st", "failure")
-                return None
+            return await self._refresh_st_via_extension(token_id, token)
 
         except Exception as e:
             debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: 刷新 ST 失败 - {str(e)}")
+            record_token_refresh("st", "failure")
+            return None
+
+    async def _refresh_st_personal(self, token_id: int, token) -> Optional[str]:
+        """Personal 模式：通过常驻 tab 刷新 ST。"""
+        if not token.current_project_id:
+            debug_logger.log_warning(f"[ST_REFRESH] Token {token_id} 没有 project_id，无法刷新 ST")
+            return None
+
+        debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST (personal)...")
+
+        from .browser_captcha_personal import BrowserCaptchaService
+        service = await BrowserCaptchaService.get_instance(self.db)
+
+        refresh_timeout_seconds = 45.0
+        try:
+            new_st = await asyncio.wait_for(
+                service.refresh_session_token(token.current_project_id),
+                timeout=refresh_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            debug_logger.log_error(
+                f"[ST_REFRESH] Token {token_id}: 刷新 ST 超时 ({refresh_timeout_seconds:.0f}s)"
+            )
+            record_token_refresh("st", "failure")
+            return None
+
+        return await self._validate_and_save_st(token_id, token, new_st)
+
+    async def _refresh_st_naturally_via_extension(self, token_id: int, token) -> Optional[str]:
+        debug_logger.log_info(
+            f"[ST_REFRESH] Token {token_id}: 通过扩展通道自然打开/刷新 Labs 页面..."
+        )
+
+        from .browser_captcha_extension import ExtensionCaptchaService
+        ext_svc = await ExtensionCaptchaService.get_instance(self.db)
+
+        new_st = await ext_svc.refresh_session_naturally(timeout=70, token_id=token_id)
+
+        return await self._validate_and_save_st(token_id, token, new_st)
+
+    async def _refresh_st_via_extension(self, token_id: int, token) -> Optional[str]:
+        """Extension 模式：通过 Chrome 扩展 WebSocket 通道触发 OAuth 重新认证。
+
+        扩展收到 refresh_session 消息后，会：
+        1. 删除旧 session cookie
+        2. 触发 NextAuth Google sign-in
+        3. 导航到 Google OAuth（利用已有 Google 登录 cookie 自动完成）
+        4. 提取新 session cookie 并返回
+        """
+        debug_logger.log_info(
+            f"[ST_REFRESH] Token {token_id}: 通过扩展通道触发 OAuth 重新认证..."
+        )
+
+        from .browser_captcha_extension import ExtensionCaptchaService
+        ext_svc = await ExtensionCaptchaService.get_instance(self.db)
+
+        new_st = await ext_svc.refresh_session_token(timeout=60, token_id=token_id)
+
+        return await self._validate_and_save_st(token_id, token, new_st)
+
+    async def _validate_and_save_st(
+        self, token_id: int, token, new_st: Optional[str]
+    ) -> Optional[str]:
+        """Validate a new ST and persist it if different from the old one."""
+        if new_st and new_st != token.st:
+            await self.db.update_token(token_id, st=new_st)
+            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST 已自动更新")
+            record_token_refresh("st", "success")
+            return new_st
+        elif new_st == token.st:
+            debug_logger.log_warning(
+                f"[ST_REFRESH] Token {token_id}: 获取到的 ST 与原 ST 相同，可能登录已失效"
+            )
+            record_token_refresh("st", "failure")
+            return None
+        else:
+            debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 无法获取新 ST")
             record_token_refresh("st", "failure")
             return None
 

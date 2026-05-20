@@ -881,6 +881,10 @@ def _patch_nodriver_browser_instance(browser_instance):
     if not browser_instance:
         return
 
+    # nodriver 0.50+ compatibility: browser.connection is None, use browser itself as shim
+    if getattr(browser_instance, "connection", None) is None and hasattr(browser_instance, "send"):
+        browser_instance.connection = browser_instance
+
     _patch_nodriver_connection_instance(getattr(browser_instance, "connection", None))
     for target in list(getattr(browser_instance, "targets", []) or []):
         _patch_nodriver_connection_instance(target)

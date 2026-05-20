@@ -15,6 +15,9 @@ RUN apt-get update \
         x11-utils \
         xauth \
         xvfb \
+        x11vnc \
+        novnc \
+        websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # 在镜像构建阶段预装 Playwright Chromium，供 personal/browser 模式复用
@@ -28,5 +31,6 @@ COPY docker/entrypoint.headed.sh /usr/local/bin/entrypoint.headed.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.headed.sh && chmod +x /usr/local/bin/entrypoint.headed.sh
 
 EXPOSE 8000
+EXPOSE 6080
 
 CMD ["/usr/local/bin/entrypoint.headed.sh"]

@@ -642,6 +642,15 @@ class Config:
             normalized = 60
         self._config["captcha"]["remote_browser_timeout"] = normalized
 
+    @property
+    def extension_generation_enabled(self) -> bool:
+        return self._config.get("captcha", {}).get("extension_generation_enabled", False)
+
+    def set_extension_generation_enabled(self, enabled: bool):
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["extension_generation_enabled"] = bool(enabled)
+
 
 # Global config instance
 config = Config()

@@ -5,6 +5,7 @@
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -48,6 +49,7 @@ ENV/
 data/*.db
 data/*.db-journal
 tmp/*
+.tmp-*/
 logs/*
 *.log
 
