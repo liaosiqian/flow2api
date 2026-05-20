@@ -367,6 +367,8 @@ class ExtensionCaptchaService:
         safe_timeout = max(5, int(timeout or 30))
         browser_timeout = max(5, safe_timeout - 2)
         message = {"type": message_type, "req_id": req_id, **request_payload}
+        message["route_key"] = conn.route_key or ""
+        message["client_label"] = conn.client_label or ""
         message.setdefault("timeout_seconds", browser_timeout)
         message.setdefault("timeout_ms", browser_timeout * 1000)
         try:

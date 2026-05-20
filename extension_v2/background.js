@@ -1,6 +1,7 @@
 let ws = null;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
+const recentCaptchaTabs = new Map();
 
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
@@ -69,6 +70,56 @@ function waitForTabReady(tabId, timeoutMs = 12000) {
             }
         });
     });
+}
+
+function getRouteKey(data) {
+    return String((data && (data.route_key || data.routeKey || data.client_label || data.clientLabel)) || "").trim();
+}
+
+async function removeTabQuietly(tabId) {
+    if (!tabId) return;
+    try {
+        await chrome.tabs.remove(tabId);
+    } catch (e) {}
+}
+
+function rememberCaptchaTab(routeKey, tabId) {
+    if (!routeKey || !tabId) return;
+    const previous = recentCaptchaTabs.get(routeKey);
+    if (previous && previous.tabId && previous.tabId !== tabId) {
+        removeTabQuietly(previous.tabId);
+    }
+    recentCaptchaTabs.set(routeKey, {
+        tabId,
+        createdAt: Date.now(),
+        inUse: false
+    });
+    setTimeout(() => {
+        const current = recentCaptchaTabs.get(routeKey);
+        if (!current || current.tabId !== tabId || current.inUse) return;
+        recentCaptchaTabs.delete(routeKey);
+        removeTabQuietly(tabId);
+    }, 90000);
+}
+
+async function takeCaptchaTab(routeKey) {
+    if (!routeKey) return null;
+    const entry = recentCaptchaTabs.get(routeKey);
+    if (!entry || !entry.tabId || entry.inUse) return null;
+    if (Date.now() - entry.createdAt > 90000) {
+        recentCaptchaTabs.delete(routeKey);
+        await removeTabQuietly(entry.tabId);
+        return null;
+    }
+    try {
+        await chrome.tabs.get(entry.tabId);
+    } catch (e) {
+        recentCaptchaTabs.delete(routeKey);
+        return null;
+    }
+    entry.inUse = true;
+    recentCaptchaTabs.delete(routeKey);
+    return entry.tabId;
 }
 
 async function connectWS() {
@@ -159,6 +210,7 @@ async function connectWS() {
 
 async function handleGetToken(data) {
     let newTabId = null;
+    let keepTabForGeneration = false;
     try {
         console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
         const newTab = await chrome.tabs.create({ url: "https://labs.google/fx/tools/flow", active: false });
@@ -219,6 +271,11 @@ async function handleGetToken(data) {
         }
 
         if (successResponse) {
+            const routeKey = getRouteKey(data);
+            if (routeKey) {
+                rememberCaptchaTab(routeKey, newTabId);
+                keepTabForGeneration = true;
+            }
             ws.send(JSON.stringify({
                 req_id: data.req_id,
                 status: successResponse.status,
@@ -238,7 +295,7 @@ async function handleGetToken(data) {
             error: err.message
         }));
     } finally {
-        if (newTabId) {
+        if (newTabId && !keepTabForGeneration) {
             try {
                 await chrome.tabs.remove(newTabId);
                 console.log("[Flow2API] Closed temporary token tab.");
@@ -252,6 +309,7 @@ async function handleGetToken(data) {
 async function handleGenerationRequest(data) {
     const FLOW_URL = "https://labs.google/fx/tools/flow";
     let newTabId = null;
+    let reusedCaptchaTab = false;
 
     function sendResult(payload) {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -263,10 +321,19 @@ async function handleGenerationRequest(data) {
     }
 
     try {
-        const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
-        newTabId = tab.id;
-        await waitForTabReady(newTabId, 20000);
-        await sleep(800);
+        const routeKey = getRouteKey(data);
+        newTabId = await takeCaptchaTab(routeKey);
+        if (newTabId) {
+            reusedCaptchaTab = true;
+            console.log("[Flow2API] Reusing captcha tab for generation:", routeKey || "(empty)");
+            await waitForTabReady(newTabId, 5000);
+            await sleep(200);
+        } else {
+            const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+            newTabId = tab.id;
+            await waitForTabReady(newTabId, 20000);
+            await sleep(800);
+        }
 
         const results = await chrome.scripting.executeScript({
             target: { tabId: newTabId },
@@ -282,11 +349,14 @@ async function handleGenerationRequest(data) {
                 const timer = setTimeout(() => controller.abort(), timeoutMs);
 
                 try {
+                    const fetchHeaders = { ...headers };
                     const response = await fetch(request.url, {
                         method,
-                        headers,
+                        headers: fetchHeaders,
                         body: hasBody ? JSON.stringify(request.json_data || {}) : undefined,
                         credentials: "include",
+                        referrer: "https://labs.google/fx/tools/flow",
+                        referrerPolicy: "strict-origin-when-cross-origin",
                         signal: controller.signal
                     });
                     const responseText = await response.text();
@@ -335,6 +405,9 @@ async function handleGenerationRequest(data) {
         if (newTabId) {
             try {
                 await chrome.tabs.remove(newTabId);
+                if (reusedCaptchaTab) {
+                    console.log("[Flow2API] Closed reused captcha generation tab.");
+                }
             } catch (e) {}
         }
     }
