@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional, List, Dict
 
+from ..core.config import config
 from ..core.logger import debug_logger
 
 
@@ -149,6 +150,11 @@ class ChromeManager:
             content = re.sub(
                 r'clientLabel:\s*"[^"]*"',
                 f'clientLabel: "{route_key}"',
+                content,
+            )
+            content = re.sub(
+                r'apiKey:\s*"[^"]*"',
+                f'apiKey: {json.dumps(str(config.api_key or ""))}',
                 content,
             )
             bg_file.write_text(content)
