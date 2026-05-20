@@ -14,9 +14,9 @@ function getSettings() {
         chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
             resolve({
                 serverUrl: (stored.serverUrl || DEFAULT_SETTINGS.serverUrl).trim(),
-                apiKey: (stored.apiKey || "").trim(),
-                routeKey: (stored.routeKey || "").trim(),
-                clientLabel: (stored.clientLabel || "").trim()
+                apiKey: (DEFAULT_SETTINGS.apiKey || stored.apiKey || "").trim(),
+                routeKey: (DEFAULT_SETTINGS.routeKey || stored.routeKey || "").trim(),
+                clientLabel: (DEFAULT_SETTINGS.clientLabel || stored.clientLabel || "").trim()
             });
         });
     });
@@ -104,6 +104,7 @@ async function connectWS() {
     };
 
     let tokenQueue = Promise.resolve();
+    let generationQueue = Promise.resolve();
 
     ws.onmessage = async (event) => {
         let data;
@@ -121,6 +122,12 @@ async function connectWS() {
         if (data.type === "get_token") {
             tokenQueue = tokenQueue.then(() => handleGetToken(data)).catch(err => {
                 console.error("[Flow2API] Queue Error:", err);
+            });
+        }
+
+        if (data.type === "submit_generation" || data.type === "poll_generation") {
+            generationQueue = generationQueue.then(() => handleGenerationRequest(data)).catch(err => {
+                console.error("[Flow2API] Generation Queue Error:", err);
             });
         }
 
@@ -238,6 +245,97 @@ async function handleGetToken(data) {
             } catch (e) {
                 console.log("[Flow2API] Error closing tab:", e);
             }
+        }
+    }
+}
+
+async function handleGenerationRequest(data) {
+    const FLOW_URL = "https://labs.google/fx/tools/flow";
+    let newTabId = null;
+
+    function sendResult(payload) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                req_id: data.req_id,
+                ...payload
+            }));
+        }
+    }
+
+    try {
+        const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+        newTabId = tab.id;
+        await waitForTabReady(newTabId, 20000);
+        await sleep(800);
+
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: newTabId },
+            world: "MAIN",
+            func: async (request) => {
+                const method = String(request.method || "POST").toUpperCase();
+                const headers = request.headers && typeof request.headers === "object"
+                    ? request.headers
+                    : {};
+                const hasBody = !["GET", "HEAD"].includes(method);
+                const controller = new AbortController();
+                const timeoutMs = Math.max(5000, Number(request.timeout_ms || 60000));
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+                try {
+                    const response = await fetch(request.url, {
+                        method,
+                        headers,
+                        body: hasBody ? JSON.stringify(request.json_data || {}) : undefined,
+                        credentials: "include",
+                        signal: controller.signal
+                    });
+                    const responseText = await response.text();
+                    let responseJson = null;
+                    try {
+                        responseJson = responseText ? JSON.parse(responseText) : null;
+                    } catch (e) {}
+                    return {
+                        ok: response.ok,
+                        status: response.status,
+                        statusText: response.statusText,
+                        text: responseText,
+                        json: responseJson
+                    };
+                } finally {
+                    clearTimeout(timer);
+                }
+            },
+            args: [{
+                url: data.url,
+                method: data.method || "POST",
+                headers: data.headers || {},
+                json_data: data.json_data || {},
+                timeout_ms: Number(data.timeout_ms || data.timeout_seconds || 60000)
+            }]
+        });
+
+        const result = results && results[0] && results[0].result;
+        if (!result) {
+            sendResult({ status: "error", error: "No generation response from browser context" });
+            return;
+        }
+
+        sendResult({
+            status: "success",
+            response_status: result.status,
+            response_text: result.text || "",
+            response_json: result.json || null
+        });
+    } catch (err) {
+        sendResult({
+            status: "error",
+            error: err && err.message ? err.message : String(err)
+        });
+    } finally {
+        if (newTabId) {
+            try {
+                await chrome.tabs.remove(newTabId);
+            } catch (e) {}
         }
     }
 }
