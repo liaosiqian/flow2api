@@ -481,9 +481,11 @@ class FlowClient:
         at: str,
         timeout: int,
         token_id: Optional[int] = None,
+        attempt_trace: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """视频 API 加硬截止，支持 Generation Proxy 优先路径。"""
         if config.extension_generation_enabled and _ext_gen_service_available:
+            ext_started_at = time.time()
             try:
                 ext_result = await self._try_extension_generation(
                     url=url,
@@ -493,15 +495,28 @@ class FlowClient:
                     timeout=timeout + 10,
                     token_id=token_id,
                 )
+                if isinstance(attempt_trace, dict):
+                    attempt_trace["via_extension_proxy"] = True
+                    attempt_trace["extension_proxy_ms"] = int((time.time() - ext_started_at) * 1000)
                 if isinstance(ext_result, dict):
                     if "media" in ext_result and "operations" not in ext_result:
                         ext_result = self._convert_media_to_operations(ext_result)
                 return ext_result
             except Exception as ext_err:
+                if isinstance(attempt_trace, dict):
+                    attempt_trace["extension_proxy_ms"] = int((time.time() - ext_started_at) * 1000)
+                    attempt_trace["extension_proxy_error"] = str(ext_err)[:500]
                 debug_logger.log_warning(f"[EXT-GEN-VIDEO] Extension proxy failed: {ext_err}")
 
+        http_started_at = time.time()
+        http_attempt_info: Optional[Dict[str, Any]] = None
+        if isinstance(attempt_trace, dict):
+            http_attempt_info = {
+                "route": "server_fallback",
+                "timeout_seconds": timeout,
+            }
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._make_request(
                     method="POST",
                     url=url,
@@ -513,8 +528,27 @@ class FlowClient:
                 ),
                 timeout=timeout + 5
             )
+            if http_attempt_info is not None:
+                http_attempt_info["duration_ms"] = int((time.time() - http_started_at) * 1000)
+                http_attempt_info["success"] = True
+                attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
+            return result
         except asyncio.TimeoutError as exc:
+            if http_attempt_info is not None:
+                http_attempt_info["duration_ms"] = int((time.time() - http_started_at) * 1000)
+                http_attempt_info["success"] = False
+                http_attempt_info["timeout_error"] = True
+                http_attempt_info["error"] = f"Flow video API request timed out after {timeout}s"
+                attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
             raise Exception(f"Flow video API request timed out after {timeout}s") from exc
+        except Exception as exc:
+            if http_attempt_info is not None:
+                http_attempt_info["duration_ms"] = int((time.time() - http_started_at) * 1000)
+                http_attempt_info["success"] = False
+                http_attempt_info["timeout_error"] = bool(self._is_timeout_error(exc))
+                http_attempt_info["error"] = str(exc)[:300]
+                attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
+            raise
 
 
     @staticmethod
@@ -1392,6 +1426,7 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        perf_trace: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """文生视频,返回task_id
 
@@ -1418,8 +1453,21 @@ class FlowClient:
         # 403/reCAPTCHA 重试逻辑 - 使用配置的最大重试次数
         max_retries = config.flow_max_retries
         last_error = None
+        upstream_trace: Optional[Dict[str, Any]] = None
+        if isinstance(perf_trace, dict):
+            upstream_trace = perf_trace.setdefault("upstream_trace", {
+                "max_retries": max_retries,
+                "generation_attempts": [],
+            })
 
         for retry_attempt in range(max_retries):
+            attempt_started_at = time.time()
+            attempt_trace: Dict[str, Any] = {
+                "attempt": retry_attempt + 1,
+                "action": "VIDEO_GENERATION",
+                "model_key": model_key,
+                "recaptcha_ok": False,
+            }
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
@@ -1428,9 +1476,15 @@ class FlowClient:
             )
             if not launch_ok:
                 last_error = Exception("Video launch queue wait timeout")
+                attempt_trace["success"] = False
+                attempt_trace["error"] = str(last_error)
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                if upstream_trace is not None:
+                    upstream_trace.setdefault("generation_attempts", []).append(attempt_trace)
                 raise last_error
 
             launch_gate_acquired = True
+            recaptcha_started_at = time.time()
             try:
                 recaptcha_token, browser_id = await self._get_recaptcha_token(
                     project_id,
@@ -1440,8 +1494,15 @@ class FlowClient:
             finally:
                 if launch_gate_acquired:
                     await self._release_video_launch_gate(token_id)
+            attempt_trace["recaptcha_ms"] = int((time.time() - recaptcha_started_at) * 1000)
+            attempt_trace["recaptcha_ok"] = bool(recaptcha_token)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
+                attempt_trace["success"] = False
+                attempt_trace["error"] = str(last_error)
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                if upstream_trace is not None:
+                    upstream_trace.setdefault("generation_attempts", []).append(attempt_trace)
                 should_retry = await self._handle_missing_recaptcha_token(
                     retry_attempt=retry_attempt,
                     max_retries=max_retries,
@@ -1490,10 +1551,21 @@ class FlowClient:
                     at=at,
                     timeout=self._get_video_submit_timeout(),
                     token_id=token_id,
+                    attempt_trace=attempt_trace,
                 )
+                attempt_trace["success"] = True
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                if upstream_trace is not None:
+                    upstream_trace.setdefault("generation_attempts", []).append(attempt_trace)
+                    upstream_trace["final_success_attempt"] = retry_attempt + 1
                 return result
             except Exception as e:
                 last_error = e
+                attempt_trace["success"] = False
+                attempt_trace["error"] = str(e)[:300]
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                if upstream_trace is not None:
+                    upstream_trace.setdefault("generation_attempts", []).append(attempt_trace)
                 should_retry = await self._handle_retryable_generation_error(
                     error=e,
                     retry_attempt=retry_attempt,
@@ -1509,6 +1581,8 @@ class FlowClient:
                 await self._notify_browser_captcha_request_finished(browser_id)
 
         # 所有重试都失败
+        if upstream_trace is not None:
+            upstream_trace["final_success_attempt"] = None
         raise last_error
 
     async def generate_video_reference_images(
