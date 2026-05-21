@@ -13,6 +13,7 @@ services:
       - ./data:/app/data
       - ./tmp:/app/tmp
       - ./config/setting.toml:/app/config/setting.toml
+      - ./profiles:/app/profiles
       - ./browser_profiles:/app/src/tmp
     environment:
       - PYTHONUNBUFFERED=1
