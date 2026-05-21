@@ -98,6 +98,72 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
             request_calls[1]["json_data"]["clientContext"],
         )
 
+    async def test_generate_image_repeats_requests_for_image_count(self):
+        client = FlowClient(proxy_manager=None)
+
+        generation_calls = []
+
+        async def fake_make_image_generation_request(**kwargs):
+            generation_calls.append(kwargs)
+            return {
+                "media": [
+                    {
+                        "name": "media-1",
+                        "image": {
+                            "generatedImage": {
+                                "fifeUrl": "https://example.com/1.png"
+                            }
+                        }
+                    },
+                    {
+                        "name": "media-2",
+                        "image": {
+                            "generatedImage": {
+                                "fifeUrl": "https://example.com/2.png"
+                            }
+                        }
+                    },
+                    {
+                        "name": "media-3",
+                        "image": {
+                            "generatedImage": {
+                                "fifeUrl": "https://example.com/3.png"
+                            }
+                        }
+                    },
+                ]
+            }
+
+        client._get_recaptcha_token = AsyncMock(return_value=("captcha-token", "browser-1"))
+        client._acquire_image_launch_gate = AsyncMock(return_value=(True, 0, 0))
+        client._release_image_launch_gate = AsyncMock()
+        client._notify_browser_captcha_request_finished = AsyncMock()
+        client._make_image_generation_request = AsyncMock(side_effect=fake_make_image_generation_request)
+
+        result, session_id, trace = await client.generate_image(
+            at="test-at",
+            project_id="project-123",
+            prompt="test prompt",
+            model_name="NARWHAL",
+            aspect_ratio="IMAGE_ASPECT_RATIO_SQUARE",
+            image_count=3,
+        )
+
+        self.assertEqual(len(result["media"]), 3)
+        self.assertTrue(session_id)
+        self.assertEqual(trace["final_success_attempt"], 1)
+        self.assertEqual(len(generation_calls), 1)
+
+        requests = generation_calls[0]["json_data"]["requests"]
+        self.assertEqual(len(requests), 3)
+        for request in requests:
+            self.assertEqual(request["imageModelName"], "NARWHAL")
+            self.assertEqual(request["imageAspectRatio"], "IMAGE_ASPECT_RATIO_SQUARE")
+            self.assertEqual(
+                request["structuredPrompt"]["parts"][0]["text"],
+                "test prompt",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

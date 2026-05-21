@@ -73,6 +73,20 @@ GEMINI_STATUS_MAP = {
     503: "UNAVAILABLE",
     504: "DEADLINE_EXCEEDED",
 }
+MAX_IMAGE_OUTPUT_COUNT = 4
+IMAGE_COUNT_PARAM_KEYS = (
+    "n",
+    "image_count",
+    "imageCount",
+    "num_images",
+    "numImages",
+    "number_of_images",
+    "numberOfImages",
+    "sample_count",
+    "sampleCount",
+    "candidate_count",
+    "candidateCount",
+)
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
@@ -86,6 +100,7 @@ class NormalizedGenerationRequest:
     model: str
     prompt: str
     images: List[bytes]
+    image_count: int = 1
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
 
@@ -420,6 +435,51 @@ def _resolve_request_model(model: str, request: Any) -> str:
     return resolved_model
 
 
+def _get_request_value(source: Any, key: str) -> Any:
+    if source is None:
+        return None
+    if isinstance(source, dict):
+        return source.get(key)
+    value = getattr(source, key, None)
+    if value is not None:
+        return value
+    extra = getattr(source, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(key)
+    return None
+
+
+def _coerce_image_count(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail="Image count must be an integer")
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Image count must be an integer")
+    if count < 1:
+        raise HTTPException(status_code=400, detail="Image count must be at least 1")
+    if count > MAX_IMAGE_OUTPUT_COUNT:
+        raise HTTPException(status_code=400, detail=f"Image count cannot exceed {MAX_IMAGE_OUTPUT_COUNT}")
+    return count
+
+
+def _extract_image_count(request: Any) -> int:
+    generation_config = _get_request_value(request, "generationConfig")
+    extra_body = _get_request_value(request, "extra_body")
+    extra_generation_config = _get_request_value(extra_body, "generationConfig")
+    image_config = _get_request_value(generation_config, "imageConfig")
+    extra_image_config = _get_request_value(extra_generation_config, "imageConfig")
+    sources = (request, extra_body, generation_config, extra_generation_config, image_config, extra_image_config)
+    for source in sources:
+        for key in IMAGE_COUNT_PARAM_KEYS:
+            count = _coerce_image_count(_get_request_value(source, key))
+            if count is not None:
+                return count
+    return 1
+
+
 def _get_request_base_url(request: Request) -> Optional[str]:
     """根据实际请求头推导对外可访问的基础地址。"""
     forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
@@ -448,6 +508,7 @@ async def _normalize_openai_request(
             model=model,
             prompt=prompt,
             images=images,
+            image_count=_extract_image_count(request),
             messages=request.messages,
             video_media_id=video_media_id,
         )
@@ -459,6 +520,7 @@ async def _normalize_openai_request(
         )
         normalized = await _normalize_gemini_request(request.model, gemini_request)
         normalized.messages = request.messages
+        normalized.image_count = _extract_image_count(request)
         return normalized
 
     raise HTTPException(status_code=400, detail="Messages or contents cannot be empty")
@@ -491,6 +553,7 @@ async def _normalize_gemini_request(
         model=resolved_model,
         prompt=prompt,
         images=images,
+        image_count=_extract_image_count(request),
     )
 
 
@@ -500,6 +563,7 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    image_count: int = 1,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -510,6 +574,7 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        image_count=image_count,
     ):
         result = chunk
 
@@ -739,6 +804,7 @@ async def _iterate_openai_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        image_count=normalized.image_count,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -763,6 +829,7 @@ async def _iterate_gemini_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        image_count=normalized.image_count,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -896,6 +963,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                image_count=normalized.image_count,
             )
         )
         return _build_openai_json_response(payload)
@@ -934,6 +1002,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    image_count=normalized.image_count,
                 )
             )
         )
@@ -1021,6 +1090,7 @@ async def _handle_async_submit(
         images=normalized.images if normalized.images else None,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        image_count=normalized.image_count,
     )
 
     return JSONResponse(content=task.to_submit_response())

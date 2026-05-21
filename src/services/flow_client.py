@@ -1129,6 +1129,7 @@ class FlowClient:
         model_name: str,
         aspect_ratio: str,
         image_inputs: Optional[List[Dict]] = None,
+        image_count: int = 1,
         token_id: Optional[int] = None,
         token_image_concurrency: Optional[int] = None,
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
@@ -1228,6 +1229,7 @@ class FlowClient:
             }
 
             # 新版图片接口使用结构化提示词 + new media 开关
+            safe_image_count = min(4, max(1, int(image_count or 1)))
             request_data = {
                 "clientContext": client_context,
                 "seed": random.randint(1, 999999),
@@ -1247,7 +1249,13 @@ class FlowClient:
                     "batchId": str(uuid.uuid4())
                 },
                 "useNewMedia": True,
-                "requests": [request_data]
+                "requests": [
+                    {
+                        **request_data,
+                        "seed": random.randint(1, 999999),
+                    }
+                    for _ in range(safe_image_count)
+                ]
             }
 
             try:

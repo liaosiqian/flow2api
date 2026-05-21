@@ -208,9 +208,10 @@ class AsyncTaskManager:
         images: Optional[List[bytes]] = None,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        image_count: int = 1,
     ):
         asyncio.create_task(
-            self._execute(task, model, prompt, images, base_url_override, video_media_id)
+            self._execute(task, model, prompt, images, base_url_override, video_media_id, image_count)
         )
 
     async def _execute(
@@ -221,6 +222,7 @@ class AsyncTaskManager:
         images: Optional[List[bytes]],
         base_url_override: Optional[str],
         video_media_id: Optional[str],
+        image_count: int,
     ):
         start_time = time.time()
         try:
@@ -244,7 +246,7 @@ class AsyncTaskManager:
             task.updated_at = datetime.utcnow()
 
             if gen_type == "image":
-                await self._execute_image(task, token, project_id, model, model_config, prompt, images, base_url_override)
+                await self._execute_image(task, token, project_id, model, model_config, prompt, images, base_url_override, image_count)
             else:
                 await self._execute_video(task, token, project_id, model, model_config, prompt, images, base_url_override, video_media_id)
 
@@ -299,7 +301,7 @@ class AsyncTaskManager:
     # ==================== Image Execution ====================
 
     async def _execute_image(
-        self, task, token, project_id, model, model_config, prompt, images, base_url_override
+        self, task, token, project_id, model, model_config, prompt, images, base_url_override, image_count
     ):
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
@@ -328,6 +330,7 @@ class AsyncTaskManager:
             model_name=model_config["model_name"],
             aspect_ratio=model_config["aspect_ratio"],
             image_inputs=image_inputs,
+            image_count=image_count,
             token_id=token.id,
             token_image_concurrency=token.image_concurrency,
             progress_callback=_progress_cb,
@@ -358,32 +361,35 @@ class AsyncTaskManager:
         if upsample_resolution and media[0].get("name"):
             task.progress = 80
             task.updated_at = datetime.utcnow()
-            try:
-                first_media_id = media[0]["name"]
-                encoded_image = await self._flow_client.upsample_image(
-                    at=token.at,
-                    project_id=project_id,
-                    media_id=first_media_id,
-                    target_resolution=upsample_resolution,
-                    user_paygate_tier=normalized_tier,
-                    session_id=session_id,
-                    token_id=token.id,
-                )
-                if encoded_image:
-                    resolution_name = "4K" if "4K" in upsample_resolution else "2K"
-                    cached_filename = await self._handler.file_cache.cache_base64_image(
-                        encoded_image, resolution_name
+            resolution_name = "4K" if "4K" in upsample_resolution else "2K"
+            for idx, item in enumerate(media):
+                media_id = item.get("name")
+                if not media_id or idx >= len(result_images):
+                    continue
+                try:
+                    encoded_image = await self._flow_client.upsample_image(
+                        at=token.at,
+                        project_id=project_id,
+                        media_id=media_id,
+                        target_resolution=upsample_resolution,
+                        user_paygate_tier=normalized_tier,
+                        session_id=session_id,
+                        token_id=token.id,
                     )
-                    base_url = (base_url_override or "").strip().rstrip("/") or ""
-                    local_url = f"{base_url}/tmp/{cached_filename}" if base_url else f"/tmp/{cached_filename}"
-                    result_images[0] = {
-                        **result_images[0],
-                        "url": local_url,
-                        "upsampled": True,
-                        "resolution": resolution_name,
-                    }
-            except Exception as exc:
-                debug_logger.log_warning(f"[ASYNC] Auto-upsample failed: {exc}")
+                    if encoded_image:
+                        cached_filename = await self._handler.file_cache.cache_base64_image(
+                            encoded_image, resolution_name
+                        )
+                        base_url = (base_url_override or "").strip().rstrip("/") or ""
+                        local_url = f"{base_url}/tmp/{cached_filename}" if base_url else f"/tmp/{cached_filename}"
+                        result_images[idx] = {
+                            **result_images[idx],
+                            "url": local_url,
+                            "upsampled": True,
+                            "resolution": resolution_name,
+                        }
+                except Exception as exc:
+                    debug_logger.log_warning(f"[ASYNC] Auto-upsample failed: {exc}")
 
         task.status = "done"
         task.progress = 100

@@ -944,6 +944,7 @@ class GenerationHandler:
         """为单次请求创建独立的响应状态，避免并发请求互相污染。"""
         return {
             "url": None,
+            "urls": None,
             "generated_assets": None,
             "base_url": None,
         }
@@ -1031,6 +1032,7 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        image_count: int = 1,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1044,6 +1046,7 @@ class GenerationHandler:
         token = None
         generation_type = None
         pending_token_state = {"active": False}
+        image_count = min(4, max(1, int(image_count or 1)))
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
         perf_trace: Dict[str, Any] = {
             "request_id": request_id,
@@ -1076,6 +1079,7 @@ class GenerationHandler:
             "model": model,
             "prompt": prompt_for_log,
             "has_images": images is not None and len(images) > 0,
+            "image_count": image_count if generation_type == "image" else None,
         }
         request_log_state.update({
             "start_time": start_time,
@@ -1225,6 +1229,7 @@ class GenerationHandler:
                 debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
                 async for chunk in self._handle_image_generation(
                     token, project_id, model_config, prompt, images, stream,
+                    image_count=image_count,
                     perf_trace=perf_trace,
                     generation_result=generation_result,
                     response_state=response_state,
@@ -1302,6 +1307,8 @@ class GenerationHandler:
             # 添加生成的URL（如果有）
             if response_state.get("url"):
                 response_data["url"] = response_state["url"]
+            if response_state.get("urls"):
+                response_data["urls"] = response_state["urls"]
             if response_state.get("generated_assets"):
                 response_data["generated_assets"] = response_state["generated_assets"]
             image_perf = perf_trace.get("image_generation", {}) if isinstance(perf_trace, dict) else {}
@@ -1408,7 +1415,8 @@ class GenerationHandler:
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
-        pending_token_state: Optional[Dict[str, bool]] = None
+        pending_token_state: Optional[Dict[str, bool]] = None,
+        image_count: int = 1,
     ) -> AsyncGenerator:
         """处理图片生成 (同步返回)"""
 
@@ -1419,6 +1427,7 @@ class GenerationHandler:
         if isinstance(perf_trace, dict):
             image_trace = perf_trace.setdefault("image_generation", {})
             image_trace["input_image_count"] = len(images) if images else 0
+            image_trace["requested_output_count"] = image_count
 
         # 不在本地等待图片硬并发槽位；请求一到就直接向上游提交。
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
@@ -1487,6 +1496,7 @@ class GenerationHandler:
                         model_name=model_config["model_name"],
                         aspect_ratio=model_config["aspect_ratio"],
                         image_inputs=image_inputs,
+                        image_count=image_count,
                         token_id=token.id,
                         token_image_concurrency=token.image_concurrency,
                         progress_callback=_image_progress_callback,
@@ -1524,6 +1534,135 @@ class GenerationHandler:
             if not media:
                 self._mark_generation_failed(generation_result, "\u751f\u6210\u7ed3\u679c\u4e3a\u7a7a")
                 yield self._create_error_response("生成结果为空", status_code=502)
+                return
+
+            if len(media) > 1:
+                origin_urls = []
+                final_urls = []
+                image_assets = []
+                upsample_resolution = model_config.get("upsample")
+                resolution_name = "4K" if upsample_resolution and "4K" in upsample_resolution else "2K"
+                upsample_started_at = time.time()
+                if upsample_resolution:
+                    await self._update_request_log_progress(request_log_state, token_id=token.id, status_text=f"upsampling_{resolution_name.lower()}", progress=82)
+                    if stream:
+                        yield self._create_stream_chunk(f"正在放大 {len(media)} 张图片到 {resolution_name}...\n")
+                cache_started_at = time.time()
+                if config.cache_enabled:
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="caching_image",
+                        progress=90,
+                    )
+
+                for idx, item in enumerate(media):
+                    generated_image = item.get("image", {}).get("generatedImage", {})
+                    origin_url = generated_image.get("fifeUrl")
+                    if not origin_url:
+                        continue
+                    media_id = item.get("name")
+                    local_url = origin_url
+                    asset = {
+                        "index": idx,
+                        "origin_image_url": origin_url,
+                        "media_id": media_id,
+                    }
+                    origin_urls.append(origin_url)
+
+                    if upsample_resolution and media_id:
+                        max_retries = config.flow_max_retries
+                        for retry_attempt in range(max_retries):
+                            try:
+                                encoded_image = await self.flow_client.upsample_image(
+                                    at=token.at,
+                                    project_id=project_id,
+                                    media_id=media_id,
+                                    target_resolution=upsample_resolution,
+                                    user_paygate_tier=normalized_tier,
+                                    session_id=generation_session_id,
+                                    token_id=token.id
+                                )
+                                if encoded_image:
+                                    try:
+                                        cached_filename = await self.file_cache.cache_base64_image(encoded_image, resolution_name)
+                                        local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                                        asset["upscaled_image"] = {
+                                            "resolution": resolution_name,
+                                            "local_url": local_url,
+                                            "url": local_url,
+                                        }
+                                    except Exception as e:
+                                        debug_logger.log_error(f"Failed to cache {resolution_name} image: {str(e)}")
+                                        asset["upscaled_image"] = {
+                                            "resolution": resolution_name,
+                                            "local_url": None,
+                                            "url": origin_url,
+                                            "delivery_mode": "origin_fallback",
+                                        }
+                                    break
+                                debug_logger.log_warning("[UPSAMPLE] 返回结果为空")
+                                break
+                            except Exception as e:
+                                error_str = str(e)
+                                debug_logger.log_error(f"[UPSAMPLE] 放大失败 (尝试 {retry_attempt + 1}/{max_retries}): {error_str}")
+                                retry_reason = self.flow_client._get_retry_reason(error_str)
+                                if retry_reason and retry_attempt < max_retries - 1:
+                                    if stream:
+                                        yield self._create_stream_chunk(f"⚠️ 第 {idx + 1} 张放大遇到{retry_reason}，正在重试 ({retry_attempt + 2}/{max_retries})...\n")
+                                    await asyncio.sleep(1)
+                                    continue
+                                if stream:
+                                    yield self._create_stream_chunk(f"⚠️ 第 {idx + 1} 张放大失败: {error_str}，返回原图...\n")
+                                break
+
+                    if config.cache_enabled and local_url == origin_url:
+                        try:
+                            cached_filename = await self.file_cache.download_and_cache(origin_url, "image")
+                            local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                        except Exception as e:
+                            debug_logger.log_error(f"Failed to cache 1K image: {str(e)}")
+                            local_url = origin_url
+
+                    asset["final_image_url"] = local_url
+                    final_urls.append(local_url)
+                    image_assets.append(asset)
+
+                if not final_urls:
+                    self._mark_generation_failed(generation_result, "\u751f\u6210\u7ed3\u679c\u4e3a\u7a7a")
+                    yield self._create_error_response("生成结果为空", status_code=502)
+                    return
+
+                if image_trace is not None:
+                    if upsample_resolution:
+                        image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
+                    image_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
+                    image_trace["output_image_count"] = len(final_urls)
+
+                response_state["url"] = final_urls[0]
+                response_state["urls"] = final_urls
+                response_state["generated_assets"] = {
+                    "type": "image",
+                    "count": len(final_urls),
+                    "origin_image_urls": origin_urls,
+                    "final_image_urls": final_urls,
+                    "items": image_assets,
+                }
+                self._mark_generation_succeeded(generation_result)
+                await self._finalize_success_request_log(
+                    request_log_state,
+                    token_id=token.id,
+                    response_state=response_state,
+                    perf_trace=perf_trace,
+                )
+                markdown = "\n".join(
+                    f"![Generated Image {idx + 1}]({url})"
+                    for idx, url in enumerate(final_urls)
+                )
+                if stream:
+                    yield self._create_stream_chunk(markdown, finish_reason="stop")
+                else:
+                    yield self._create_completion_response(markdown, media_type="markdown")
                 return
 
             image_url = media[0]["image"]["generatedImage"]["fifeUrl"]
@@ -2354,6 +2493,8 @@ class GenerationHandler:
             # 媒体生成: 根据媒体类型格式化内容为Markdown
             if media_type == "video":
                 formatted_content = f"```html\n<video src='{content}' controls></video>\n```"
+            elif media_type == "markdown":
+                formatted_content = content
             else:  # image
                 formatted_content = f"![Generated Image]({content})"
 
@@ -2496,6 +2637,8 @@ class GenerationHandler:
         if isinstance(response_state, dict):
             if response_state.get("url"):
                 response_data["url"] = response_state["url"]
+            if response_state.get("urls"):
+                response_data["urls"] = response_state["urls"]
             if response_state.get("generated_assets"):
                 response_data["generated_assets"] = response_state["generated_assets"]
 
