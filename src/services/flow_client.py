@@ -1299,11 +1299,15 @@ class FlowClient:
 
             launch_gate_acquired = True
             try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="IMAGE_GENERATION",
-                    token_id=token_id
-                )
+                if config.extension_generation_enabled and _ext_gen_service_available:
+                    recaptcha_token = "EXTENSION_WILL_HANDLE"
+                    browser_id = None
+                else:
+                    recaptcha_token, browser_id = await self._get_recaptcha_token(
+                        project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id
+                    )
             finally:
                 if launch_gate_acquired:
                     await self._release_image_launch_gate(token_id)
