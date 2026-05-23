@@ -455,7 +455,6 @@ async function handleGenerationRequest(data) {
         });
         // Only keep the tab for reuse if Google returned a successful response.
         // Tabs that received 4xx/5xx are "tainted" and reCAPTCHA will reject them.
-        const routeKey = getRouteKey(data);
         if (routeKey && newTabId && result.ok) {
             rememberCaptchaTab(routeKey, newTabId);
             newTabId = null; // prevent finally from removing it
