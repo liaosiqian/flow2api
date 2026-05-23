@@ -21,6 +21,7 @@ services:
       - DISPLAY=:99
       - XVFB_SCREEN=1440x900x24
       - CHROME_BINARY=/usr/local/lib/python3.11/site-packages/playwright/driver/package/.local-browsers/chromium-1223/chrome-linux64/chrome
+      - CHROME_PROXY=socks5://warp:1080
     shm_size: "512m"
     restart: unless-stopped
     depends_on:

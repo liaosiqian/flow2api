@@ -133,8 +133,13 @@ class ChromeManager:
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-hang-monitor",
-            ChromeManager.START_URL,
         ]
+
+        chrome_proxy = os.environ.get("CHROME_PROXY", "").strip()
+        if chrome_proxy:
+            args.append(f"--proxy-server={chrome_proxy}")
+
+        args.append(ChromeManager.START_URL)
         return args
 
     def _prepare_extension_copy(self, route_key: str, profile_dir: Path) -> Path:
