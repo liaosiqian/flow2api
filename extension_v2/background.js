@@ -456,7 +456,7 @@ async function handleGenerationRequest(data) {
         // Keep the tab for potential follow-up atomic generation
         const routeKey = getRouteKey(data);
         if (routeKey && newTabId) {
-            putCaptchaTab(routeKey, newTabId);
+            rememberCaptchaTab(routeKey, newTabId);
             newTabId = null; // prevent finally from removing it
         }
     } catch (err) {
