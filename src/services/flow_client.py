@@ -1393,20 +1393,8 @@ class FlowClient:
 
             try:
                 result = None
-                if config.extension_generation_enabled and _ext_gen_service_available:
-                    try:
-                        result = await self._try_atomic_generation(
-                            url=url,
-                            json_data=json_data,
-                            at_token=at,
-                            recaptcha_action="IMAGE_GENERATION",
-                            token_path="clientContext.recaptchaContext.token",
-                            timeout=config.upsample_timeout + 10,
-                            token_id=token_id,
-                        )
-                    except Exception as ext_err:
-                        debug_logger.log_warning(f"[EXT-ATOMIC-UPSAMPLE] Atomic generation failed: {ext_err}")
-                        result = None
+                # atomic_generation disabled: extension hangs on separate tab creation
+                # fallback to get_token + submit_generation which is proven to work
 
                 if result is None:
                     recaptcha_token, browser_id = await self._get_recaptcha_token(
