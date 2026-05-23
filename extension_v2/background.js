@@ -328,7 +328,11 @@ async function handleGenerationRequest(data) {
 
     try {
         const routeKey = getRouteKey(data);
-        newTabId = await takeCaptchaTab(routeKey);
+        // When needs_recaptcha, always use a fresh tab to avoid "tainted" context.
+        // Google detects reused tabs that previously made API requests.
+        if (!data.needs_recaptcha) {
+            newTabId = await takeCaptchaTab(routeKey);
+        }
         if (newTabId) {
             reusedCaptchaTab = true;
             console.log("[Flow2API] Reusing captcha tab for generation:", routeKey || "(empty)");
@@ -338,7 +342,7 @@ async function handleGenerationRequest(data) {
             const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
             newTabId = tab.id;
             await waitForTabReady(newTabId, 20000);
-            await sleep(800);
+            await sleep(data.needs_recaptcha ? 1500 : 800);
         }
 
         // If needs_recaptcha, solve reCAPTCHA first in the same tab
@@ -453,9 +457,10 @@ async function handleGenerationRequest(data) {
             response_text: result.text || "",
             response_json: result.json || null
         });
-        // Keep the tab for potential follow-up atomic generation
+        // Only keep the tab for reuse if Google returned a successful response.
+        // Tabs that received 4xx/5xx are "tainted" and reCAPTCHA will reject them.
         const routeKey = getRouteKey(data);
-        if (routeKey && newTabId) {
+        if (routeKey && newTabId && result.ok) {
             rememberCaptchaTab(routeKey, newTabId);
             newTabId = null; // prevent finally from removing it
         }
