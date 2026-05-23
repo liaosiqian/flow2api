@@ -1453,22 +1453,20 @@ class FlowClient:
 
             try:
                 result = None
-                # Use submit_generation with needs_recaptcha flag:
-                # the extension solves reCAPTCHA and sends the request in the same tab
+                # Try atomic generation (reuses warm captcha tab from image gen)
                 if config.extension_generation_enabled and _ext_gen_service_available:
                     try:
-                        result = await self._try_extension_generation_with_recaptcha(
+                        result = await self._try_atomic_generation(
                             url=url,
-                            method="POST",
                             json_data=json_data,
                             at_token=at,
                             recaptcha_action="IMAGE_GENERATION",
                             token_path="clientContext.recaptchaContext.token",
-                            timeout=config.upsample_timeout + 10,
+                            timeout=90,
                             token_id=token_id,
                         )
                     except Exception as ext_err:
-                        print(f"[UPSAMPLE-DEBUG] Extension w/ recaptcha failed: {str(ext_err)[:500]}", flush=True)
+                        print(f"[UPSAMPLE-DEBUG] Atomic failed: {str(ext_err)[:300]}", flush=True)
                         result = None
 
                 if result is None:

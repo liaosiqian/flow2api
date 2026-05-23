@@ -453,6 +453,12 @@ async function handleGenerationRequest(data) {
             response_text: result.text || "",
             response_json: result.json || null
         });
+        // Keep the tab for potential follow-up atomic generation
+        const routeKey = getRouteKey(data);
+        if (routeKey && newTabId) {
+            putCaptchaTab(routeKey, newTabId);
+            newTabId = null; // prevent finally from removing it
+        }
     } catch (err) {
         sendResult({
             status: "error",
@@ -481,10 +487,19 @@ async function handleAtomicGeneration(data) {
     }
 
     try {
-        const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
-        newTabId = tab.id;
-        await waitForTabReady(newTabId, 20000);
-        await sleep(1500);
+        const routeKey = getRouteKey(data);
+        newTabId = await takeCaptchaTab(routeKey);
+        if (newTabId) {
+            console.log("[Flow2API] Atomic: reusing captcha tab");
+            await waitForTabReady(newTabId, 5000);
+            await sleep(300);
+        } else {
+            console.log("[Flow2API] Atomic: creating fresh tab (no captcha tab available)");
+            const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+            newTabId = tab.id;
+            await waitForTabReady(newTabId, 20000);
+            await sleep(1500);
+        }
 
         const recaptchaAction = data.recaptcha_action || "IMAGE_GENERATION";
         const tokenTimeoutMs = recaptchaAction === "VIDEO_GENERATION" ? 30000 : 20000;
