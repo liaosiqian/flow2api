@@ -422,7 +422,6 @@ async function handleGenerationRequest(data) {
 async function handleAtomicGeneration(data) {
     const FLOW_URL = "https://labs.google/fx/tools/flow";
     let newTabId = null;
-    let reusedCaptchaTab = false;
 
     function sendResult(payload) {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -431,141 +430,110 @@ async function handleAtomicGeneration(data) {
     }
 
     try {
-        const routeKey = getRouteKey(data);
-        newTabId = await takeCaptchaTab(routeKey);
-        if (newTabId) {
-            reusedCaptchaTab = true;
-            await waitForTabReady(newTabId, 5000);
-            await sleep(200);
-        } else {
-            const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
-            newTabId = tab.id;
-            await waitForTabReady(newTabId, 20000);
-            await sleep(2500);
-        }
+        const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+        newTabId = tab.id;
+        await waitForTabReady(newTabId, 20000);
+        await sleep(1500);
 
         const recaptchaAction = data.recaptcha_action || "IMAGE_GENERATION";
-        const scriptTimeoutMs = recaptchaAction === "VIDEO_GENERATION" ? 40000 : 30000;
-        const overallTimeoutMs = scriptTimeoutMs + 15000;
+        const tokenTimeoutMs = recaptchaAction === "VIDEO_GENERATION" ? 30000 : 20000;
 
-        const scriptPromise = chrome.scripting.executeScript({
+        // Step 1: Get reCAPTCHA token (same pattern as handleGetToken - proven to work)
+        const tokenResults = await chrome.scripting.executeScript({
             target: { tabId: newTabId },
             world: "MAIN",
-            func: async (request, captchaAction, timeoutMs) => {
-                const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-
-                function loadRecaptcha() {
-                    return new Promise((resolve, reject) => {
+            func: async (action, timeoutMs) => {
+                return new Promise((resolve, reject) => {
+                    let settled = false;
+                    const finish = (fn, value) => { if (settled) return; settled = true; fn(value); };
+                    try {
+                        function run() {
+                            grecaptcha.enterprise.ready(function() {
+                                grecaptcha.enterprise.execute("6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV", { action: action })
+                                    .then(token => finish(resolve, token))
+                                    .catch(err => finish(reject, err.message || "reCAPTCHA failed"));
+                            });
+                        }
                         if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
-                            resolve();
-                            return;
+                            run();
+                        } else {
+                            const s = document.createElement("script");
+                            s.src = "https://www.google.com/recaptcha/enterprise.js?render=6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+                            s.onload = run;
+                            s.onerror = () => finish(reject, "Failed to load enterprise.js");
+                            document.head.appendChild(s);
                         }
-                        let attempts = 0;
-                        const poll = setInterval(() => {
-                            attempts++;
-                            if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
-                                clearInterval(poll);
-                                resolve();
-                            } else if (attempts > 20) {
-                                clearInterval(poll);
-                                const s = document.createElement("script");
-                                s.src = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
-                                s.onload = () => resolve();
-                                s.onerror = () => reject(new Error("Failed to load enterprise.js"));
-                                document.head.appendChild(s);
-                                setTimeout(() => reject(new Error("enterprise.js load timeout")), 15000);
-                            }
-                        }, 500);
-                        setTimeout(() => { clearInterval(poll); reject(new Error("grecaptcha not available after wait")); }, 20000);
-                    });
-                }
+                        setTimeout(() => finish(reject, "Timeout getting reCAPTCHA token"), timeoutMs);
+                    } catch (e) { finish(reject, e.message); }
+                });
+            },
+            args: [recaptchaAction, tokenTimeoutMs]
+        });
 
-                async function getToken() {
-                    await loadRecaptcha();
-                    return new Promise((resolve, reject) => {
-                        const tokenTimeout = setTimeout(
-                            () => reject(new Error("reCAPTCHA ready/execute timeout")), 20000
-                        );
-                        grecaptcha.enterprise.ready(() => {
-                            grecaptcha.enterprise.execute(SITE_KEY, { action: captchaAction })
-                                .then(t => { clearTimeout(tokenTimeout); resolve(t); })
-                                .catch(err => { clearTimeout(tokenTimeout); reject(new Error(err.message || "reCAPTCHA failed")); });
-                        });
-                    });
-                }
+        const token = tokenResults && tokenResults[0] && tokenResults[0].result;
+        if (!token) {
+            const tokenErr = tokenResults && tokenResults[0] && tokenResults[0].error;
+            sendResult({ status: "error", error: tokenErr ? (tokenErr.message || String(tokenErr)) : "Failed to get reCAPTCHA token" });
+            return;
+        }
 
+        // Step 2: Inject token and make API request (same pattern as handleGenerationRequest)
+        let body = data.json_data || {};
+        if (data.token_path) {
+            const parts = data.token_path.split(".");
+            let obj = body;
+            for (let i = 0; i < parts.length - 1; i++) {
+                if (!obj[parts[i]]) obj[parts[i]] = {};
+                obj = obj[parts[i]];
+            }
+            obj[parts[parts.length - 1]] = token;
+        }
+
+        const fetchTimeoutMs = Math.max(5000, Number(data.timeout_ms || 60000));
+        const fetchResults = await chrome.scripting.executeScript({
+            target: { tabId: newTabId },
+            world: "MAIN",
+            func: async (request) => {
                 const controller = new AbortController();
+                const timeoutMs = Math.max(5000, Number(request.timeout_ms || 60000));
                 const timer = setTimeout(() => controller.abort(), timeoutMs);
-
                 try {
-                    const token = await getToken();
-                    if (!token) throw new Error("Empty reCAPTCHA token");
-
-                    let body = request.json_data || {};
-                    if (request.token_path) {
-                        const parts = request.token_path.split(".");
-                        let obj = body;
-                        for (let i = 0; i < parts.length - 1; i++) {
-                            if (!obj[parts[i]]) obj[parts[i]] = {};
-                            obj = obj[parts[i]];
-                        }
-                        obj[parts[parts.length - 1]] = token;
-                    }
-
-                    const method = String(request.method || "POST").toUpperCase();
                     const response = await fetch(request.url, {
-                        method,
+                        method: String(request.method || "POST").toUpperCase(),
                         headers: request.headers || {},
-                        body: JSON.stringify(body),
+                        body: JSON.stringify(request.body),
                         credentials: "include",
                         referrer: "https://labs.google/fx/tools/flow",
                         referrerPolicy: "strict-origin-when-cross-origin",
                         signal: controller.signal
                     });
-
                     const responseText = await response.text();
                     let responseJson = null;
                     try { responseJson = responseText ? JSON.parse(responseText) : null; } catch (e) {}
-
                     return {
                         ok: response.ok,
                         status: response.status,
                         statusText: response.statusText,
                         text: responseText,
-                        json: responseJson,
-                        recaptcha_token: token
+                        json: responseJson
                     };
                 } finally {
                     clearTimeout(timer);
                 }
             },
-            args: [
-                {
-                    url: data.url,
-                    method: data.method || "POST",
-                    headers: data.headers || {},
-                    json_data: data.json_data || {},
-                    token_path: data.token_path || "clientContext.recaptchaContext.token",
-                    timeout_ms: Number(data.timeout_ms || 60000)
-                },
-                recaptchaAction,
-                scriptTimeoutMs
-            ]
+            args: [{
+                url: data.url,
+                method: data.method || "POST",
+                headers: data.headers || {},
+                body: body,
+                timeout_ms: fetchTimeoutMs
+            }]
         });
 
-        const results = await Promise.race([
-            scriptPromise,
-            new Promise((_, reject) => setTimeout(
-                () => reject(new Error(`Atomic executeScript overall timeout (${overallTimeoutMs}ms)`)),
-                overallTimeoutMs
-            ))
-        ]);
-
-        const result = results && results[0] && results[0].result;
+        const result = fetchResults && fetchResults[0] && fetchResults[0].result;
         if (!result) {
-            const scriptError = results && results[0] && results[0].error;
-            const errMsg = scriptError ? (scriptError.message || JSON.stringify(scriptError)) : "No response from atomic generation";
-            sendResult({ status: "error", error: errMsg });
+            const fetchErr = fetchResults && fetchResults[0] && fetchResults[0].error;
+            sendResult({ status: "error", error: fetchErr ? (fetchErr.message || String(fetchErr)) : "No response from fetch" });
             return;
         }
 
@@ -574,7 +542,7 @@ async function handleAtomicGeneration(data) {
             response_status: result.status,
             response_text: result.text || "",
             response_json: result.json || null,
-            recaptcha_token: result.recaptcha_token || null
+            recaptcha_token: token
         });
     } catch (err) {
         sendResult({
@@ -584,10 +552,6 @@ async function handleAtomicGeneration(data) {
     } finally {
         if (newTabId) {
             try { await chrome.tabs.remove(newTabId); } catch (e) {}
-            if (reusedCaptchaTab) {
-                const routeKey = getRouteKey(data);
-                recentCaptchaTabs.delete(routeKey);
-            }
         }
     }
 }
