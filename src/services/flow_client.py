@@ -1453,10 +1453,12 @@ class FlowClient:
 
             try:
                 result = None
-                # Try atomic generation (reuses warm captcha tab from image gen)
+                # Use extension generation with inline reCAPTCHA (submit_generation + needs_recaptcha)
+                # This reuses handleGenerationRequest which is proven reliable,
+                # unlike handleAtomicGeneration which hangs on executeScript.
                 if config.extension_generation_enabled and _ext_gen_service_available:
                     try:
-                        result = await self._try_atomic_generation(
+                        result = await self._try_extension_generation_with_recaptcha(
                             url=url,
                             json_data=json_data,
                             at_token=at,
@@ -1466,7 +1468,7 @@ class FlowClient:
                             token_id=token_id,
                         )
                     except Exception as ext_err:
-                        print(f"[UPSAMPLE-DEBUG] Atomic failed: {str(ext_err)[:300]}", flush=True)
+                        print(f"[UPSAMPLE-DEBUG] Extension w/ recaptcha failed: {str(ext_err)[:300]}", flush=True)
                         result = None
 
                 if result is None:
