@@ -123,6 +123,30 @@ MODEL_CONFIG = {
         "model_name": "IMAGEN_3_5",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT"
     },
+    "imagen-4.0-generate-preview-landscape-2k": {
+        "type": "image",
+        "model_name": "IMAGEN_3_5",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
+    },
+    "imagen-4.0-generate-preview-portrait-2k": {
+        "type": "image",
+        "model_name": "IMAGEN_3_5",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
+        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
+    },
+    "imagen-4.0-generate-preview-landscape-4k": {
+        "type": "image",
+        "model_name": "IMAGEN_3_5",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
+    },
+    "imagen-4.0-generate-preview-portrait-4k": {
+        "type": "image",
+        "model_name": "IMAGEN_3_5",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
+        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
+    },
 
     # 图片生成 - NARWHAL (新版)
     "gemini-3.1-flash-image-landscape": {
