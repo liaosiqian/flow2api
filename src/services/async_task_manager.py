@@ -666,10 +666,28 @@ class AsyncTaskManager:
         self, task, media_id, target_resolution, base_url_override
     ):
         start_time = time.time()
+        log_id = None
+        operation = "upsample_image"
+        resolution_name = "4K" if "4K" in target_resolution else "2K"
+        request_payload = {
+            "media_id": media_id,
+            "target_resolution": target_resolution,
+            "resolution_name": resolution_name,
+            "task_id": task.task_id,
+        }
+
         try:
             task.status = "processing"
             task.progress = 10
             task.updated_at = datetime.utcnow()
+
+            log_id = await self._write_request_log(
+                token_id=None, operation=operation,
+                status_code=102, duration=0,
+                status_text="started", progress=5,
+                request_data=request_payload,
+                response_data={"status": "processing", "task_id": task.task_id},
+            )
 
             ctx = self.get_media_context(media_id)
             if not ctx:
@@ -707,7 +725,6 @@ class AsyncTaskManager:
             if not encoded_image:
                 raise RuntimeError("Upsample returned empty result")
 
-            resolution_name = "4K" if "4K" in target_resolution else "2K"
             cached_filename = await self._handler.file_cache.cache_base64_image(
                 encoded_image, resolution_name
             )
@@ -728,6 +745,21 @@ class AsyncTaskManager:
                 f"[ASYNC] Upsample {task.task_id} completed in {duration:.1f}s"
             )
 
+            await self._write_request_log(
+                token_id=token.id, operation=operation,
+                status_code=200, duration=duration,
+                status_text="completed", progress=100,
+                request_data=request_payload,
+                response_data={
+                    "status": "success",
+                    "media_id": media_id,
+                    "resolution": resolution_name,
+                    "upsampled_url": local_url,
+                    "performance": {"total_ms": int(duration * 1000)},
+                },
+                log_id=log_id,
+            )
+
         except Exception as exc:
             task.status = "failed"
             task.error = str(exc)[:1000]
@@ -736,4 +768,18 @@ class AsyncTaskManager:
             record_generation_result("image", "failed", duration)
             debug_logger.log_error(
                 f"[ASYNC] Upsample {task.task_id} failed: {exc}"
+            )
+
+            await self._write_request_log(
+                token_id=task.token_id, operation=operation,
+                status_code=500, duration=duration,
+                status_text="failed", progress=task.progress,
+                request_data=request_payload,
+                response_data={
+                    "error": str(exc)[:500],
+                    "media_id": media_id,
+                    "resolution": resolution_name,
+                    "performance": {"total_ms": int(duration * 1000)},
+                },
+                log_id=log_id,
             )
