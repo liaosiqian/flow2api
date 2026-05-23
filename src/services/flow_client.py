@@ -672,7 +672,7 @@ class FlowClient:
             headers["authorization"] = f"Bearer {at_token}"
 
         async with self._ext_proxy_lock:
-            return await svc.submit_atomic_generation(
+            raw_result = await svc.submit_atomic_generation(
                 url=url,
                 method="POST",
                 headers=headers,
@@ -682,6 +682,9 @@ class FlowClient:
                 timeout=timeout,
                 token_id=token_id,
             )
+
+        from .extension_generation_service import ExtensionGenerationService
+        return ExtensionGenerationService._unwrap_extension_response(raw_result)
 
     async def _make_image_generation_request(
         self,
