@@ -47,7 +47,7 @@ ssh -o ProxyCommand=none ubuntu@43.135.154.121 \
 - `extension_v2/` 是当前 headed/extension 模式使用的正式插件目录。
 - Chrome 路径必须动态解析，不要硬编码 Playwright Chromium 版本目录。
 - `cryptography` 是 Chrome Cookie DB 解密所需依赖，不能从 `requirements.txt` 移除。
-- `extension_generation_enabled` 默认应保持 `False`，避免未完整验证的浏览器代理生成路径默认开启。
+- `extension_generation_enabled` 建议保持 `True`（在 `config/setting.toml` 的 `[captcha]` 段）。启用后图片/视频生成请求通过 Chrome Extension 浏览器直接发出，避免 server-side 指纹与 reCAPTCHA token 不一致导致 `UNUSUAL_ACTIVITY`。Extension proxy 失败时自动降级为 server-side 发请求。
 
 ## 部署后验证
 

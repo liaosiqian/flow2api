@@ -450,21 +450,36 @@ async function handleAtomicGeneration(data) {
                             resolve();
                             return;
                         }
-                        const s = document.createElement("script");
-                        s.src = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
-                        s.onload = () => resolve();
-                        s.onerror = () => reject(new Error("Failed to load enterprise.js"));
-                        document.head.appendChild(s);
+                        let attempts = 0;
+                        const poll = setInterval(() => {
+                            attempts++;
+                            if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
+                                clearInterval(poll);
+                                resolve();
+                            } else if (attempts > 20) {
+                                clearInterval(poll);
+                                const s = document.createElement("script");
+                                s.src = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
+                                s.onload = () => resolve();
+                                s.onerror = () => reject(new Error("Failed to load enterprise.js"));
+                                document.head.appendChild(s);
+                                setTimeout(() => reject(new Error("enterprise.js load timeout")), 15000);
+                            }
+                        }, 500);
+                        setTimeout(() => { clearInterval(poll); reject(new Error("grecaptcha not available after wait")); }, 20000);
                     });
                 }
 
                 async function getToken() {
                     await loadRecaptcha();
                     return new Promise((resolve, reject) => {
+                        const tokenTimeout = setTimeout(
+                            () => reject(new Error("reCAPTCHA ready/execute timeout")), 20000
+                        );
                         grecaptcha.enterprise.ready(() => {
                             grecaptcha.enterprise.execute(SITE_KEY, { action: captchaAction })
-                                .then(resolve)
-                                .catch(err => reject(new Error(err.message || "reCAPTCHA failed")));
+                                .then(t => { clearTimeout(tokenTimeout); resolve(t); })
+                                .catch(err => { clearTimeout(tokenTimeout); reject(new Error(err.message || "reCAPTCHA failed")); });
                         });
                     });
                 }
@@ -530,7 +545,9 @@ async function handleAtomicGeneration(data) {
 
         const result = results && results[0] && results[0].result;
         if (!result) {
-            sendResult({ status: "error", error: "No response from atomic generation" });
+            const scriptError = results && results[0] && results[0].error;
+            const errMsg = scriptError ? (scriptError.message || JSON.stringify(scriptError)) : "No response from atomic generation";
+            sendResult({ status: "error", error: errMsg });
             return;
         }
 
