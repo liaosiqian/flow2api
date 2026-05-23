@@ -801,4 +801,26 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     }
 });
 
+// MV3: service worker is lazy — must register startup/install events to ensure activation
+chrome.runtime.onStartup.addListener(() => {
+    console.log("[Flow2API] Chrome started (onStartup), connecting WebSocket...");
+    connectWS();
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+    console.log("[Flow2API] Extension installed/updated (onInstalled), connecting WebSocket...");
+    connectWS();
+});
+
+// Also create a periodic alarm to keep service worker alive and reconnect if needed
+chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === "keepalive") {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            console.log("[Flow2API] Keepalive: WebSocket not open, reconnecting...");
+            connectWS();
+        }
+    }
+});
+
 connectWS();
