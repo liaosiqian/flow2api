@@ -1,6 +1,7 @@
 """Async task manager for non-blocking generation via ?async=true."""
 
 import asyncio
+import json
 import random
 import re
 import string
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from ..core.logger import debug_logger
+from ..core.models import RequestLog
 from ..core.monitoring import record_generation_result
 from ..core.account_tiers import (
     normalize_user_paygate_tier,
@@ -225,6 +227,9 @@ class AsyncTaskManager:
         image_count: int,
     ):
         start_time = time.time()
+        log_id = None
+        model_config = None
+        operation = "generate_unknown"
         try:
             task.status = "processing"
             task.progress = 5
@@ -235,6 +240,14 @@ class AsyncTaskManager:
                 raise ValueError(f"Unknown model: {model}")
 
             gen_type = model_config["type"]
+            operation = f"generate_{gen_type}"
+
+            log_id = await self._write_request_log(
+                token_id=None, operation=operation,
+                status_code=102, duration=0,
+                status_text="submitted", progress=5,
+                prompt=prompt, model=model, task_id=task.task_id,
+            )
 
             token = await self._select_and_prepare_token(model, gen_type)
             task.token_id = token.id
@@ -255,6 +268,15 @@ class AsyncTaskManager:
             await self._token_manager.record_usage(token.id, is_video=is_video)
             await self._token_manager.record_success(token.id)
             record_generation_result(gen_type, "success", duration)
+
+            await self._write_request_log(
+                token_id=token.id, operation=operation,
+                status_code=200, duration=duration,
+                status_text="completed", progress=100,
+                prompt=prompt, model=model, task_id=task.task_id,
+                log_id=log_id,
+            )
+
             debug_logger.log_info(
                 f"[ASYNC] Task {task.task_id} completed in {duration:.1f}s"
             )
@@ -272,9 +294,71 @@ class AsyncTaskManager:
                     await self._token_manager.record_error(task.token_id)
                 except Exception:
                     pass
+
+            await self._write_request_log(
+                token_id=task.token_id, operation=operation,
+                status_code=500, duration=duration,
+                status_text="failed", progress=task.progress,
+                prompt=prompt, model=model, task_id=task.task_id,
+                log_id=log_id, error=str(exc)[:500],
+            )
+
             debug_logger.log_error(
                 f"[ASYNC] Task {task.task_id} failed after {duration:.1f}s: {exc}"
             )
+
+    async def _write_request_log(
+        self,
+        token_id: Optional[int],
+        operation: str,
+        status_code: int,
+        duration: float,
+        status_text: str,
+        progress: int,
+        prompt: str,
+        model: str,
+        task_id: str,
+        log_id: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> Optional[int]:
+        try:
+            request_data = {"model": model, "prompt": prompt[:200], "task_id": task_id}
+            if error:
+                response_data = {"error": error}
+            else:
+                response_data = {"task_id": task_id, "status": status_text}
+
+            request_body = json.dumps(request_data, ensure_ascii=False)
+            response_body = json.dumps(response_data, ensure_ascii=False)
+
+            if log_id:
+                await self._db.update_request_log(
+                    log_id,
+                    token_id=token_id,
+                    operation=operation,
+                    request_body=request_body,
+                    response_body=response_body,
+                    status_code=status_code,
+                    duration=duration,
+                    status_text=status_text,
+                    progress=max(0, min(100, int(progress))),
+                )
+                return log_id
+
+            log = RequestLog(
+                token_id=token_id,
+                operation=operation,
+                request_body=request_body,
+                response_body=response_body,
+                status_code=status_code,
+                duration=duration,
+                status_text=status_text,
+                progress=max(0, min(100, int(progress))),
+            )
+            return await self._db.add_request_log(log)
+        except Exception as e:
+            debug_logger.log_error(f"[ASYNC] Failed to write request log: {e}")
+            return None
 
     async def _select_and_prepare_token(self, model: str, gen_type: str):
         is_image = gen_type == "image"
