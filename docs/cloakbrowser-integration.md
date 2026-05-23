@@ -193,3 +193,84 @@ git revert HEAD  # 回滚 CloakBrowser 集成 commit
 3. **许可证**：MIT License，商用无限制
 4. **不需要代理**：CloakBrowser 不内置代理轮换，使用现有网络配置即可
 5. **auto-update**：生产环境建议固定版本，避免自动更新导致不稳定
+
+## VNC 连接和浏览器截图方法
+
+### VNC 连接
+
+Flow2API headed 模式使用 Xvfb 虚拟 X11 显示，并通过 x11vnc 暴露 VNC 端口。
+
+```bash
+# 容器端口映射（docker-compose.headed.yml）
+# VNC 端口: 5900 -> 宿主机映射端口（检查 docker-compose 配置）
+
+# 从本地通过 SSH 隧道连接 VNC
+ssh -L 5900:localhost:5900 ubuntu@43.135.154.121
+
+# 然后使用 VNC 客户端（如 macOS 内置 Screen Sharing 或 RealVNC）连接：
+# vnc://localhost:5900
+```
+
+### 浏览器截图方式
+
+容器内没有 `import` (ImageMagick) 命令。可用以下方式截图：
+
+**方式 1：通过 xdotool + scrot（如果已安装）**
+```bash
+ssh ubuntu@43.135.154.121 'sudo docker exec flow2api-headed bash -c "
+  apt-get install -y scrot 2>/dev/null
+  DISPLAY=:99 scrot /tmp/screenshot.png
+"'
+# 拷贝到宿主机
+ssh ubuntu@43.135.154.121 'sudo docker cp flow2api-headed:/tmp/screenshot.png /tmp/'
+# 拷贝到本地
+scp ubuntu@43.135.154.121:/tmp/screenshot.png ~/Desktop/
+```
+
+**方式 2：通过 Python + Playwright CDP 截图**
+```bash
+ssh ubuntu@43.135.154.121 'sudo docker exec flow2api-headed python3 -c "
+import asyncio
+from playwright.async_api import async_playwright
+
+async def screenshot():
+    p = await async_playwright().start()
+    # 需要 Chrome 启动时带 --remote-debugging-port=9222
+    browser = await p.chromium.connect_over_cdp(\"http://127.0.0.1:9222\")
+    ctx = browser.contexts[0]
+    pages = ctx.pages
+    if pages:
+        await pages[0].screenshot(path=\"/tmp/browser.png\")
+        print(\"Screenshot saved to /tmp/browser.png\")
+    await p.stop()
+
+asyncio.run(screenshot())
+"'
+```
+注意：方式 2 需要 Chrome 启动时添加 `--remote-debugging-port=9222` 参数。
+
+**方式 3：通过 xdotool 获取窗口信息（无截图）**
+```bash
+# 获取 Chrome 窗口标题
+ssh ubuntu@43.135.154.121 'sudo docker exec flow2api-headed bash -c "
+  DISPLAY=:99 xdotool search --class chromium getwindowname 2>/dev/null
+"'
+
+# 模拟键盘输入
+ssh ubuntu@43.135.154.121 'sudo docker exec flow2api-headed bash -c "
+  DISPLAY=:99 xdotool type --delay 100 \"hello world\"
+"'
+
+# 模拟鼠标点击（坐标 x=100, y=200）
+ssh ubuntu@43.135.154.121 'sudo docker exec flow2api-headed bash -c "
+  DISPLAY=:99 xdotool mousemove 100 200 click 1
+"'
+```
+
+### 推荐配置：启用 CDP 远程调试
+
+为方便后续调试和自动化截图，建议在 `chrome_manager.py` 的启动参数中添加：
+```
+--remote-debugging-port=9222
+```
+并在 `docker-compose.headed.yml` 中映射该端口。这样可以用 Playwright CDP 连接进行页面交互和截图。
