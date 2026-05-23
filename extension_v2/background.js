@@ -328,11 +328,7 @@ async function handleGenerationRequest(data) {
 
     try {
         const routeKey = getRouteKey(data);
-        // When needs_recaptcha, always use a fresh tab to avoid "tainted" context.
-        // Google detects reused tabs that previously made API requests.
-        if (!data.needs_recaptcha) {
-            newTabId = await takeCaptchaTab(routeKey);
-        }
+        newTabId = await takeCaptchaTab(routeKey);
         if (newTabId) {
             reusedCaptchaTab = true;
             console.log("[Flow2API] Reusing captcha tab for generation:", routeKey || "(empty)");
@@ -342,7 +338,7 @@ async function handleGenerationRequest(data) {
             const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
             newTabId = tab.id;
             await waitForTabReady(newTabId, 20000);
-            await sleep(data.needs_recaptcha ? 1500 : 800);
+            await sleep(data.needs_recaptcha ? 2000 : 800);
         }
 
         // If needs_recaptcha, solve reCAPTCHA first in the same tab

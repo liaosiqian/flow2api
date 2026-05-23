@@ -1453,9 +1453,11 @@ class FlowClient:
 
             try:
                 result = None
+                # Brief delay before upsample to avoid being flagged by reCAPTCHA
+                # (immediate sequential operations look bot-like to Google)
+                await asyncio.sleep(3)
+
                 # Use extension generation with inline reCAPTCHA (submit_generation + needs_recaptcha)
-                # This reuses handleGenerationRequest which is proven reliable,
-                # unlike handleAtomicGeneration which hangs on executeScript.
                 if config.extension_generation_enabled and _ext_gen_service_available:
                     try:
                         result = await self._try_extension_generation_with_recaptcha(
