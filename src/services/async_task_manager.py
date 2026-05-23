@@ -258,12 +258,16 @@ class AsyncTaskManager:
                 response_data={"status": "processing", "task_id": task.task_id},
             )
 
+            token_select_started = time.time()
             token = await self._select_and_prepare_token(model, gen_type)
+            token_select_ms = int((time.time() - token_select_started) * 1000)
             task.token_id = token.id
             task.progress = 15
             task.updated_at = datetime.utcnow()
 
+            project_started = time.time()
             project_id = await self._token_manager.ensure_project_exists(token.id)
+            ensure_project_ms = int((time.time() - project_started) * 1000)
             task.progress = 22
             task.updated_at = datetime.utcnow()
 
@@ -278,15 +282,40 @@ class AsyncTaskManager:
             await self._token_manager.record_success(token.id)
             record_generation_result(gen_type, "success", duration)
 
+            perf = {
+                "request_id": task.task_id,
+                "model": model,
+                "status": "success",
+                "token_select_ms": token_select_ms,
+                "ensure_project_ms": ensure_project_ms,
+                "total_ms": int(duration * 1000),
+            }
+            perf_data = getattr(task, "_perf_data", None)
+            if perf_data:
+                if gen_type == "image":
+                    perf["image_generation"] = perf_data
+                else:
+                    perf["video_generation"] = perf_data
+            perf["generation_pipeline_ms"] = int(duration * 1000) - token_select_ms - ensure_project_ms
+
             response_data = {
                 "status": "success",
                 "model": model,
                 "prompt": prompt[:500],
-                "performance": {"total_ms": int(duration * 1000)},
+                "performance": perf,
             }
             if task.result:
                 if task.result.get("images"):
                     response_data["urls"] = [img.get("url", "") for img in task.result["images"]]
+                    images_with_assets = [img for img in task.result["images"] if img.get("upsampled")]
+                    if images_with_assets:
+                        response_data["generated_assets"] = {
+                            "type": "image",
+                            "upscaled_images": [
+                                {"resolution": img.get("resolution"), "url": img.get("url")}
+                                for img in images_with_assets
+                            ],
+                        }
                 elif task.result.get("video_url"):
                     response_data["url"] = task.result["video_url"]
 
@@ -411,6 +440,7 @@ class AsyncTaskManager:
     ):
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
+        upload_started_at = time.time()
         image_inputs = []
         if images:
             for image_bytes in images:
@@ -421,6 +451,7 @@ class AsyncTaskManager:
                     "name": media_id,
                     "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
                 })
+        upload_ms = int((time.time() - upload_started_at) * 1000)
 
         task.progress = 35
         task.updated_at = datetime.utcnow()
@@ -429,7 +460,8 @@ class AsyncTaskManager:
             task.progress = min(progress, 70)
             task.updated_at = datetime.utcnow()
 
-        result, session_id, _ = await self._flow_client.generate_image(
+        gen_started_at = time.time()
+        result, session_id, perf_trace = await self._flow_client.generate_image(
             at=token.at,
             project_id=project_id,
             prompt=prompt,
@@ -441,6 +473,7 @@ class AsyncTaskManager:
             token_image_concurrency=token.image_concurrency,
             progress_callback=_progress_cb,
         )
+        generate_api_ms = int((time.time() - gen_started_at) * 1000)
 
         task.progress = 72
         task.updated_at = datetime.utcnow()
@@ -464,10 +497,12 @@ class AsyncTaskManager:
                     self.register_media(item_media_id, token.id, project_id, session_id)
 
         upsample_resolution = model_config.get("upsample")
+        upsample_ms = 0
         if upsample_resolution and media[0].get("name"):
             task.progress = 80
             task.updated_at = datetime.utcnow()
             resolution_name = "4K" if "4K" in upsample_resolution else "2K"
+            upsample_started_at = time.time()
             for idx, item in enumerate(media):
                 media_id = item.get("name")
                 if not media_id or idx >= len(result_images):
@@ -496,11 +531,22 @@ class AsyncTaskManager:
                         }
                 except Exception as exc:
                     debug_logger.log_warning(f"[ASYNC] Auto-upsample failed: {exc}")
+            upsample_ms = int((time.time() - upsample_started_at) * 1000)
 
         task.status = "done"
         task.progress = 100
         task.result = {"images": result_images}
         task.updated_at = datetime.utcnow()
+
+        task._perf_data = {
+            "input_image_count": len(images) if images else 0,
+            "requested_output_count": image_count,
+            "upload_images_ms": upload_ms,
+            "generate_api_ms": generate_api_ms,
+            "upstream_trace": perf_trace,
+            "upsample_ms": upsample_ms if upsample_resolution else None,
+            "upsample_resolution": upsample_resolution,
+        }
 
     # ==================== Video Execution ====================
 
@@ -523,6 +569,7 @@ class AsyncTaskManager:
 
         aspect_ratio = mc_copy.get("aspect_ratio", "VIDEO_ASPECT_RATIO_LANDSCAPE")
 
+        upload_started_at = time.time()
         if video_type == "t2v":
             images = None
         elif video_type == "i2v" and images:
@@ -542,6 +589,7 @@ class AsyncTaskManager:
                     "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
                     "mediaId": mid,
                 })
+        upload_ms = int((time.time() - upload_started_at) * 1000)
 
         task.progress = 30
         task.updated_at = datetime.utcnow()
@@ -558,6 +606,7 @@ class AsyncTaskManager:
         }
         use_v2 = mc_copy.get("use_v2_model_config", False)
 
+        submit_started_at = time.time()
         if video_type == "t2v":
             result = await self._flow_client.generate_video_text(
                 **base_kwargs, use_v2_model_config=use_v2,
@@ -586,6 +635,7 @@ class AsyncTaskManager:
             )
         else:
             raise ValueError(f"Unknown video_type: {video_type}")
+        submit_ms = int((time.time() - submit_started_at) * 1000)
 
         operations = result.get("operations", [])
         if not operations:
@@ -597,6 +647,7 @@ class AsyncTaskManager:
         poll_interval = getattr(app_config, "poll_interval", 3)
         max_polls = getattr(app_config, "max_poll_attempts", 500)
         consecutive_errors = 0
+        poll_started_at = time.time()
 
         for poll_count in range(max_polls):
             await asyncio.sleep(poll_interval)
@@ -634,6 +685,7 @@ class AsyncTaskManager:
                 if not video_url:
                     raise RuntimeError("Video completed but no URL in result")
 
+                poll_ms = int((time.time() - poll_started_at) * 1000)
                 task.status = "done"
                 task.progress = 100
                 task.result = {
@@ -641,6 +693,17 @@ class AsyncTaskManager:
                     "duration_seconds": 8,
                 }
                 task.updated_at = datetime.utcnow()
+
+                task._perf_data = {
+                    "video_type": video_type,
+                    "model_key": resolved_key,
+                    "aspect_ratio": aspect_ratio,
+                    "input_image_count": len(images) if images else 0,
+                    "upload_images_ms": upload_ms,
+                    "submit_api_ms": submit_ms,
+                    "poll_ms": poll_ms,
+                    "poll_count": poll_count + 1,
+                }
                 return
 
             if status == "MEDIA_GENERATION_STATUS_FAILED":
