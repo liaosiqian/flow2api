@@ -242,11 +242,20 @@ class AsyncTaskManager:
             gen_type = model_config["type"]
             operation = f"generate_{gen_type}"
 
+            request_payload = {
+                "model": model,
+                "prompt": prompt[:2000],
+                "has_images": images is not None and len(images) > 0,
+                "image_count": image_count if gen_type == "image" else None,
+                "task_id": task.task_id,
+            }
+
             log_id = await self._write_request_log(
                 token_id=None, operation=operation,
                 status_code=102, duration=0,
-                status_text="submitted", progress=5,
-                prompt=prompt, model=model, task_id=task.task_id,
+                status_text="started", progress=5,
+                request_data=request_payload,
+                response_data={"status": "processing", "task_id": task.task_id},
             )
 
             token = await self._select_and_prepare_token(model, gen_type)
@@ -269,11 +278,24 @@ class AsyncTaskManager:
             await self._token_manager.record_success(token.id)
             record_generation_result(gen_type, "success", duration)
 
+            response_data = {
+                "status": "success",
+                "model": model,
+                "prompt": prompt[:500],
+                "performance": {"total_ms": int(duration * 1000)},
+            }
+            if task.result:
+                if task.result.get("images"):
+                    response_data["urls"] = [img.get("url", "") for img in task.result["images"]]
+                elif task.result.get("video_url"):
+                    response_data["url"] = task.result["video_url"]
+
             await self._write_request_log(
                 token_id=token.id, operation=operation,
                 status_code=200, duration=duration,
                 status_text="completed", progress=100,
-                prompt=prompt, model=model, task_id=task.task_id,
+                request_data=request_payload,
+                response_data=response_data,
                 log_id=log_id,
             )
 
@@ -295,12 +317,20 @@ class AsyncTaskManager:
                 except Exception:
                     pass
 
+            request_payload_fallback = {
+                "model": model,
+                "prompt": prompt[:2000],
+                "has_images": images is not None and len(images) > 0,
+                "task_id": task.task_id,
+            }
+
             await self._write_request_log(
                 token_id=task.token_id, operation=operation,
                 status_code=500, duration=duration,
                 status_text="failed", progress=task.progress,
-                prompt=prompt, model=model, task_id=task.task_id,
-                log_id=log_id, error=str(exc)[:500],
+                request_data=request_payload if 'request_payload' in locals() else request_payload_fallback,
+                response_data={"error": str(exc)[:500], "performance": {"total_ms": int(duration * 1000)}},
+                log_id=log_id,
             )
 
             debug_logger.log_error(
@@ -315,19 +345,11 @@ class AsyncTaskManager:
         duration: float,
         status_text: str,
         progress: int,
-        prompt: str,
-        model: str,
-        task_id: str,
+        request_data: Dict[str, Any],
+        response_data: Dict[str, Any],
         log_id: Optional[int] = None,
-        error: Optional[str] = None,
     ) -> Optional[int]:
         try:
-            request_data = {"model": model, "prompt": prompt[:200], "task_id": task_id}
-            if error:
-                response_data = {"error": error}
-            else:
-                response_data = {"task_id": task_id, "status": status_text}
-
             request_body = json.dumps(request_data, ensure_ascii=False)
             response_body = json.dumps(response_data, ensure_ascii=False)
 
