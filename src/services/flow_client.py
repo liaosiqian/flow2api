@@ -1440,9 +1440,11 @@ class FlowClient:
                             timeout=config.upsample_timeout
                         )
 
+                print(f"[UPSAMPLE-DEBUG] Response keys: {list(result.keys()) if isinstance(result, dict) else type(result)} encoded_len={len(result.get('encodedImage','')) if isinstance(result,dict) else 'N/A'}", flush=True)
                 return result.get("encodedImage", "")
             except Exception as e:
                 last_error = e
+                print(f"[UPSAMPLE-DEBUG] Exception: {str(e)[:200]}", flush=True)
                 should_retry = await self._handle_retryable_generation_error(
                     error=e,
                     retry_attempt=retry_attempt,
