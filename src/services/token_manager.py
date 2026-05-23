@@ -203,6 +203,56 @@ class TokenManager:
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
 
+    async def soft_disable_token(self, token_id: int):
+        """System auto-disable: keep Chrome running, attempt recovery."""
+        await self.db.update_token(token_id, is_active=False)
+        debug_logger.log_warning(f"[SOFT_DISABLE] Token {token_id} soft-disabled, starting recovery")
+        asyncio.create_task(self._attempt_recovery(token_id))
+
+    async def hard_disable_token(self, token_id: int):
+        """User manual disable or recovery exhausted: stop Chrome."""
+        await self.db.update_token(token_id, is_active=False)
+        debug_logger.log_warning(f"[HARD_DISABLE] Token {token_id} hard-disabled, stopping Chrome")
+        try:
+            from .chrome_manager import ChromeManager
+            chrome_mgr = await ChromeManager.get_instance()
+            if chrome_mgr:
+                await chrome_mgr.stop_instance(token_id)
+        except Exception as e:
+            debug_logger.log_warning(f"[HARD_DISABLE] Failed to stop Chrome for token {token_id}: {e}")
+
+    async def _attempt_recovery(self, token_id: int, max_attempts: int = 3):
+        """Background recovery: try refreshing via extension before giving up."""
+        for attempt in range(1, max_attempts + 1):
+            await asyncio.sleep(30 * attempt)
+
+            try:
+                token = await self.db.get_token(token_id)
+                if not token:
+                    return
+                if getattr(token, "is_active", False):
+                    return
+
+                new_st = await self._try_refresh_st(token_id, token)
+                if new_st:
+                    ok = await self._do_refresh_at(token_id, new_st)
+                    if ok:
+                        await self.enable_token(token_id)
+                        msg = f"[RECOVERY] Token {token_id} recovered at attempt {attempt}"
+                        debug_logger.log_info(msg)
+                        print(msg, flush=True)
+                        return
+            except Exception as e:
+                msg = f"[RECOVERY] Token {token_id} attempt {attempt}/{max_attempts} failed: {e}"
+                debug_logger.log_warning(msg)
+                print(msg, flush=True)
+
+        msg = f"[RECOVERY] Token {token_id} recovery exhausted after {max_attempts} attempts -> hard_disable"
+        debug_logger.log_error(msg)
+        print(msg, flush=True)
+        await self.hard_disable_token(token_id)
+
+
     # ========== Token添加 (支持Project创建) ==========
 
     async def add_token(
@@ -219,38 +269,74 @@ class TokenManager:
         extension_route_key: Optional[str] = None,
     ) -> Token:
         """Add a new token and prepare its pooled projects."""
-        existing_token = await self.db.get_token_by_st(st)
-        if existing_token:
-            raise ValueError(f"Token ??????: {existing_token.email}?")
-
-        debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
-        try:
-            result = await self.flow_client.st_to_at(st)
-            at = result["access_token"]
-            expires = result.get("expires")
-            user_info = result.get("user", {})
-            email = user_info.get("email", "")
-            name = user_info.get("name", email.split("@")[0] if email else "")
+        # empty-st-flow: allow creating token without ST for VNC login flow
+        if not st or not st.strip():
+            at = ""
             at_expires = None
-            if expires:
-                try:
-                    at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-                except Exception:
-                    pass
-        except Exception as e:
-            raise ValueError(f"ST?AT??: {str(e)}")
-
-        try:
-            credits_result = await self.flow_client.get_credits(at)
-            credits = credits_result.get("credits", 0)
-            user_paygate_tier = credits_result.get("userPaygateTier")
-        except Exception:
+            email = remark or "pending_login"
+            name = email
             credits = 0
             user_paygate_tier = None
+            debug_logger.log_info(f"[ADD_TOKEN] Empty ST - creating shell token for VNC login")
+        else:
+            existing_token = await self.db.get_token_by_st(st)
+            if existing_token:
+                raise ValueError(f"Token ??????: {existing_token.email}?")
+
+            debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
+            try:
+                result = await self.flow_client.st_to_at(st)
+                at = result["access_token"]
+                expires = result.get("expires")
+                user_info = result.get("user", {})
+                email = user_info.get("email", "")
+                name = user_info.get("name", email.split("@")[0] if email else "")
+                at_expires = None
+                if expires:
+                    try:
+                        at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                    except Exception:
+                        pass
+            except Exception as e:
+                raise ValueError(f"ST?AT??: {str(e)}")
+
+            try:
+                credits_result = await self.flow_client.get_credits(at)
+                credits = credits_result.get("credits", 0)
+                user_paygate_tier = credits_result.get("userPaygateTier")
+            except Exception:
+                credits = 0
+                user_paygate_tier = None
 
         base_project_name = self._normalize_project_name_base(project_name)
         project_pool_size = self._get_project_pool_size()
         pooled_projects: List[Project] = []
+
+        if not st or not st.strip():
+            # empty-st-flow: skip project creation, create minimal token
+            token = Token(
+                st=st or "",
+                at=at,
+                at_expires=at_expires,
+                email=email,
+                name=name,
+                remark=remark,
+                is_active=True,
+                credits=credits,
+                user_paygate_tier=user_paygate_tier,
+                current_project_id=None,
+                current_project_name=None,
+                image_enabled=image_enabled,
+                video_enabled=video_enabled,
+                image_concurrency=image_concurrency,
+                video_concurrency=video_concurrency,
+                captcha_proxy_url=captcha_proxy_url,
+                extension_route_key=extension_route_key,
+            )
+            token_id = await self.db.add_token(token)
+            token.id = token_id
+            debug_logger.log_info(f"[ADD_TOKEN] Shell token created (ID: {token_id}, email: {email})")
+            return token
 
         if project_id:
             first_project_name = self._build_project_name(1, base_project_name)
@@ -549,8 +635,8 @@ class TokenManager:
                 if result:
                     return True
 
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
-            await self.disable_token(token_id)
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, soft-disabling")
+            await self.soft_disable_token(token_id)
             return False
 
     async def _refresh_at(self, token_id: int) -> bool:
@@ -881,9 +967,9 @@ class TokenManager:
         if stats and stats.consecutive_error_count >= admin_config.error_ban_threshold:
             debug_logger.log_warning(
                 f"[TOKEN_BAN] Token {token_id} consecutive error count ({stats.consecutive_error_count}) "
-                f"reached threshold ({admin_config.error_ban_threshold}), auto-disabling"
+                f"reached threshold ({admin_config.error_ban_threshold}), soft-disabling"
             )
-            await self.disable_token(token_id)
+            await self.soft_disable_token(token_id)
 
     async def record_success(self, token_id: int):
         """Record successful request (reset consecutive error count)

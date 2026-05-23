@@ -346,6 +346,45 @@ class ChromeManager:
                 )
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
 
+    async def start_instance(self, token_id: int, email: str) -> bool:
+        """Dynamically start a Chrome instance for a single token (no container restart needed)."""
+        route_key = f"token_{token_id}"
+
+        if route_key in self._instances and self._instances[route_key].is_running():
+            print(f"[ChromeManager] Instance already running: {route_key}")
+            return True
+
+        profile_dir = self._get_profile_dir(token_id, email)
+        ext_dir = self._prepare_extension_copy(route_key, profile_dir)
+        data_dir = profile_dir / "data"
+
+        window_offset = len(self._instances)
+        instance = _ChromeInstance(
+            label=route_key,
+            extension_dir=str(ext_dir),
+            user_data_dir=str(data_dir),
+            window_offset=window_offset,
+        )
+        success = await instance.start()
+        if success:
+            self._instances[route_key] = instance
+            await self._ensure_route_key_in_db(token_id, route_key)
+            print(f"[ChromeManager] Dynamic start: {route_key} (PID={instance.pid}, email={email})")
+        else:
+            print(f"[ChromeManager] Dynamic start failed: {route_key}")
+        return success
+
+    async def stop_instance(self, token_id: int) -> bool:
+        """Dynamically stop a Chrome instance for a single token."""
+        route_key = f"token_{token_id}"
+        instance = self._instances.pop(route_key, None)
+        if instance:
+            await instance.stop()
+            print(f"[ChromeManager] Dynamic stop: {route_key}")
+            return True
+        print(f"[ChromeManager] No running instance for: {route_key}")
+        return False
+
     @property
     def status(self) -> dict:
         return {
@@ -421,6 +460,15 @@ class _ChromeInstance:
             return False
 
         os.makedirs(self.user_data_dir, exist_ok=True)
+
+        # Clean stale Chrome singleton locks (left by old containers with different hostnames)
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lock_path = os.path.join(self.user_data_dir, lock_name)
+            if os.path.exists(lock_path) or os.path.islink(lock_path):
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
 
         args = ChromeManager._build_chrome_args(
             extension_dir=self.extension_dir,

@@ -483,7 +483,7 @@ class LoginRequest(BaseModel):
 
 
 class AddTokenRequest(BaseModel):
-    st: str
+    st: Optional[str] = None
     project_id: Optional[str] = None  # 用户可选输入project_id
     project_name: Optional[str] = None
     remark: Optional[str] = None
@@ -724,7 +724,7 @@ async def add_token(
     """Add a new token"""
     try:
         new_token = await token_manager.add_token(
-            st=request.st,
+            st=request.st or "",
             project_id=request.project_id,  # 🆕 支持用户指定project_id
             project_name=request.project_name,
             remark=request.remark,
@@ -744,6 +744,17 @@ async def add_token(
                 video_concurrency=new_token.video_concurrency
             )
 
+        # chrome auto-start on add
+        browser_started = False
+        try:
+            from ..services.chrome_manager import ChromeManager
+            chrome_mgr = await ChromeManager.get_instance()
+            if chrome_mgr and getattr(new_token, "is_active", True):
+                email = getattr(new_token, "email", "") or f"token_{new_token.id}"
+                browser_started = await chrome_mgr.start_instance(new_token.id, email)
+        except Exception:
+            pass
+
         return {
             "success": True,
             "message": "Token添加成功",
@@ -753,7 +764,8 @@ async def add_token(
                 "credits": new_token.credits,
                 "project_id": new_token.current_project_id,
                 "project_name": new_token.current_project_name
-            }
+            },
+            "browser_started": browser_started
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -835,9 +847,21 @@ async def enable_token(
     token_id: int,
     token: str = Depends(verify_admin_token)
 ):
-    """Enable token"""
+    """Enable token and start Chrome instance"""
     await token_manager.enable_token(token_id)
-    return {"success": True, "message": "Token已启用"}
+
+    browser_started = False
+    try:
+        from ..services.chrome_manager import ChromeManager
+        chrome_mgr = await ChromeManager.get_instance()
+        if chrome_mgr:
+            token_info = await token_manager.db.get_token(token_id)
+            email = getattr(token_info, "email", "") or f"token_{token_id}"
+            browser_started = await chrome_mgr.start_instance(token_id, email)
+    except Exception:
+        pass
+
+    return {"success": True, "message": "Token已启用", "browser_started": browser_started}
 
 
 @router.post("/api/tokens/{token_id}/disable")
@@ -845,8 +869,8 @@ async def disable_token(
     token_id: int,
     token: str = Depends(verify_admin_token)
 ):
-    """Disable token"""
-    await token_manager.disable_token(token_id)
+    """Disable token and stop Chrome instance (hard disable)"""
+    await token_manager.hard_disable_token(token_id)
     return {"success": True, "message": "Token已禁用"}
 
 
@@ -865,6 +889,48 @@ async def refresh_credits(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"刷新余额失败: {str(e)}")
+
+
+@router.post("/api/tokens/{token_id}/start-browser")
+async def start_browser(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """Manually start Chrome instance for a token"""
+    try:
+        from ..services.chrome_manager import ChromeManager
+        chrome_mgr = await ChromeManager.get_instance()
+        if not chrome_mgr:
+            raise HTTPException(status_code=400, detail="Chrome manager not available")
+        token_info = await token_manager.db.get_token(token_id)
+        if not token_info:
+            raise HTTPException(status_code=404, detail="Token not found")
+        email = getattr(token_info, "email", "") or f"token_{token_id}"
+        started = await chrome_mgr.start_instance(token_id, email)
+        return {"success": started, "route_key": f"token_{token_id}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/tokens/{token_id}/stop-browser")
+async def stop_browser(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """Manually stop Chrome instance for a token"""
+    try:
+        from ..services.chrome_manager import ChromeManager
+        chrome_mgr = await ChromeManager.get_instance()
+        if not chrome_mgr:
+            raise HTTPException(status_code=400, detail="Chrome manager not available")
+        stopped = await chrome_mgr.stop_instance(token_id)
+        return {"success": stopped}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/api/tokens/{token_id}/refresh-at")
