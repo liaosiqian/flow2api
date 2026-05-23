@@ -664,6 +664,8 @@ class FlowClient:
         if not svc.active_connections:
             raise RuntimeError("No active extension connections")
 
+        print(f"[ATOMIC-DEBUG] Starting atomic generation, active_conns={len(svc.active_connections)}", flush=True)
+
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",

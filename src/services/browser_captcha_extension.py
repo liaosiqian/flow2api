@@ -372,12 +372,15 @@ class ExtensionCaptchaService:
         message.setdefault("timeout_seconds", browser_timeout)
         message.setdefault("timeout_ms", browser_timeout * 1000)
         try:
+            print(f"[EXT-GEN-DEBUG] Sending {message_type} req_id={req_id} timeout={safe_timeout}s", flush=True)
             debug_logger.log_info(
                 f"[EXT-GEN] Dispatching {message_type} via label={conn.client_label or '-'}, "
                 f"url={str(request_payload.get('url',''))[:80]}"
             )
             await conn.websocket.send_text(json.dumps(message))
+            print(f"[EXT-GEN-DEBUG] Message sent, waiting for response...", flush=True)
             result = await asyncio.wait_for(future, timeout=safe_timeout)
+            print(f"[EXT-GEN-DEBUG] Got response: status={result.get('status') if isinstance(result, dict) else 'invalid'}", flush=True)
             if not isinstance(result, dict):
                 raise RuntimeError("Invalid extension generation response format")
             if result.get("status") == "success":
@@ -385,6 +388,7 @@ class ExtensionCaptchaService:
             error_msg = str(result.get("error") or "Extension generation request failed")
             raise RuntimeError(error_msg)
         except asyncio.TimeoutError as exc:
+            print(f"[EXT-GEN-DEBUG] TIMEOUT after {safe_timeout}s for {message_type}", flush=True)
             raise RuntimeError(f"Extension generation {message_type} timeout after {safe_timeout}s") from exc
         finally:
             self.pending_generation_requests.pop(req_id, None)
@@ -466,6 +470,7 @@ class ExtensionCaptchaService:
         """Execute reCAPTCHA + API request atomically in one browser tab."""
         if not self.active_connections:
             raise RuntimeError("No extension connections for atomic generation")
+        capped_timeout = min(timeout, 90)
         route_key = await self._resolve_route_key(token_id)
         conn = self._select_connection(route_key)
         if conn is None:
@@ -486,5 +491,5 @@ class ExtensionCaptchaService:
             conn,
             message_type="atomic_generation",
             request_payload=payload,
-            timeout=timeout,
+            timeout=capped_timeout,
         )
