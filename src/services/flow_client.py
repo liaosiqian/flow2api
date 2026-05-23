@@ -761,11 +761,12 @@ class FlowClient:
         # === Extension Generation Proxy (priority path) ===
         if config.extension_generation_enabled and _ext_gen_service_available:
             try:
-                ext_result = await self._try_extension_generation(
+                ext_result = await self._try_extension_generation_with_recaptcha(
                     url=url,
-                    method="POST",
                     json_data=json_data,
                     at_token=at,
+                    recaptcha_action="IMAGE_GENERATION",
+                    token_path="clientContext.recaptchaContext.token",
                     timeout=config.flow_image_request_timeout + 10,
                     token_id=token_id,
                 )
