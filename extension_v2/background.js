@@ -422,6 +422,7 @@ async function handleGenerationRequest(data) {
 async function handleAtomicGeneration(data) {
     const FLOW_URL = "https://labs.google/fx/tools/flow";
     let newTabId = null;
+    let reusedCaptchaTab = false;
 
     function sendResult(payload) {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -430,15 +431,24 @@ async function handleAtomicGeneration(data) {
     }
 
     try {
-        const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
-        newTabId = tab.id;
-        await waitForTabReady(newTabId, 20000);
-        await sleep(1200);
+        const routeKey = getRouteKey(data);
+        newTabId = await takeCaptchaTab(routeKey);
+        if (newTabId) {
+            reusedCaptchaTab = true;
+            await waitForTabReady(newTabId, 5000);
+            await sleep(200);
+        } else {
+            const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+            newTabId = tab.id;
+            await waitForTabReady(newTabId, 20000);
+            await sleep(2500);
+        }
 
         const recaptchaAction = data.recaptcha_action || "IMAGE_GENERATION";
         const scriptTimeoutMs = recaptchaAction === "VIDEO_GENERATION" ? 40000 : 30000;
+        const overallTimeoutMs = scriptTimeoutMs + 15000;
 
-        const results = await chrome.scripting.executeScript({
+        const scriptPromise = chrome.scripting.executeScript({
             target: { tabId: newTabId },
             world: "MAIN",
             func: async (request, captchaAction, timeoutMs) => {
@@ -543,6 +553,14 @@ async function handleAtomicGeneration(data) {
             ]
         });
 
+        const results = await Promise.race([
+            scriptPromise,
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error(`Atomic executeScript overall timeout (${overallTimeoutMs}ms)`)),
+                overallTimeoutMs
+            ))
+        ]);
+
         const result = results && results[0] && results[0].result;
         if (!result) {
             const scriptError = results && results[0] && results[0].error;
@@ -566,6 +584,10 @@ async function handleAtomicGeneration(data) {
     } finally {
         if (newTabId) {
             try { await chrome.tabs.remove(newTabId); } catch (e) {}
+            if (reusedCaptchaTab) {
+                const routeKey = getRouteKey(data);
+                recentCaptchaTabs.delete(routeKey);
+            }
         }
     }
 }
