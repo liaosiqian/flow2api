@@ -638,6 +638,51 @@ class FlowClient:
                 token_id=token_id,
             )
 
+    async def _try_atomic_generation(
+        self,
+        *,
+        url: str,
+        json_data: dict = None,
+        at_token: str = None,
+        recaptcha_action: str = "IMAGE_GENERATION",
+        token_path: str = "clientContext.recaptchaContext.token",
+        timeout: int = 60,
+        token_id: int = None,
+    ) -> dict:
+        """Execute reCAPTCHA + API request atomically in one browser tab.
+
+        This eliminates the server roundtrip between token acquisition and request
+        submission, resolving reCAPTCHA session mismatch issues.
+        """
+        if not _ext_gen_service_available:
+            raise RuntimeError("ExtensionGenerationService not available")
+        if not config.extension_generation_enabled:
+            raise RuntimeError("Extension generation not enabled")
+
+        from .browser_captcha_extension import ExtensionCaptchaService
+        svc = await ExtensionCaptchaService.get_instance(self.db)
+        if not svc.active_connections:
+            raise RuntimeError("No active extension connections")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if at_token:
+            headers["authorization"] = f"Bearer {at_token}"
+
+        async with self._ext_proxy_lock:
+            return await svc.submit_atomic_generation(
+                url=url,
+                method="POST",
+                headers=headers,
+                json_data=json_data,
+                token_path=token_path,
+                recaptcha_action=recaptcha_action,
+                timeout=timeout,
+                token_id=token_id,
+            )
+
     async def _make_image_generation_request(
         self,
         url: str,
@@ -1320,29 +1365,10 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/flow/upsampleImage"
 
-        # 403/reCAPTCHA/500 重试逻辑 - 使用配置的最大重试次数
         max_retries = config.flow_max_retries
         last_error = None
 
         for retry_attempt in range(max_retries):
-            # 获取 reCAPTCHA token - 使用 IMAGE_GENERATION action
-            recaptcha_token, browser_id = await self._get_recaptcha_token(
-                project_id,
-                action="IMAGE_GENERATION",
-                token_id=token_id
-            )
-            if not recaptcha_token:
-                last_error = Exception("Failed to obtain reCAPTCHA token")
-                should_retry = await self._handle_missing_recaptcha_token(
-                    retry_attempt=retry_attempt,
-                    max_retries=max_retries,
-                    browser_id=browser_id,
-                    project_id=project_id,
-                    log_prefix="[IMAGE UPSAMPLE] 放大",
-                )
-                if should_retry:
-                    continue
-                raise last_error
             upsample_session_id = session_id or self._generate_session_id()
 
             json_data = {
@@ -1350,7 +1376,7 @@ class FlowClient:
                 "targetResolution": target_resolution,
                 "clientContext": {
                     "recaptchaContext": {
-                        "token": recaptcha_token,
+                        "token": "",
                         "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB"
                     },
                     "sessionId": upsample_session_id,
@@ -1360,35 +1386,67 @@ class FlowClient:
                 }
             }
 
-            # 4K/2K 放大使用专用超时，因为返回的 base64 数据量很大
-            # 优先走 Chrome 扩展代理（与图片生成一致），避免 reCAPTCHA 环境不一致导致 403
             try:
                 result = None
                 if config.extension_generation_enabled and _ext_gen_service_available:
                     try:
-                        result = await self._try_extension_generation(
+                        result = await self._try_atomic_generation(
                             url=url,
-                            method="POST",
                             json_data=json_data,
                             at_token=at,
+                            recaptcha_action="IMAGE_GENERATION",
+                            token_path="clientContext.recaptchaContext.token",
                             timeout=config.upsample_timeout + 10,
                             token_id=token_id,
                         )
                     except Exception as ext_err:
-                        debug_logger.log_warning(f"[EXT-GEN-UPSAMPLE] Extension proxy failed: {ext_err}")
+                        debug_logger.log_warning(f"[EXT-ATOMIC-UPSAMPLE] Atomic generation failed: {ext_err}")
                         result = None
 
                 if result is None:
-                    result = await self._make_request(
-                        method="POST",
-                        url=url,
-                        json_data=json_data,
-                        use_at=True,
-                        at_token=at,
-                        timeout=config.upsample_timeout
+                    recaptcha_token, browser_id = await self._get_recaptcha_token(
+                        project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id
                     )
+                    if not recaptcha_token:
+                        last_error = Exception("Failed to obtain reCAPTCHA token")
+                        should_retry = await self._handle_missing_recaptcha_token(
+                            retry_attempt=retry_attempt,
+                            max_retries=max_retries,
+                            browser_id=browser_id,
+                            project_id=project_id,
+                            log_prefix="[IMAGE UPSAMPLE] 放大",
+                        )
+                        if should_retry:
+                            continue
+                        raise last_error
+                    json_data["clientContext"]["recaptchaContext"]["token"] = recaptcha_token
 
-                # 返回 base64 编码的图片
+                    if config.extension_generation_enabled and _ext_gen_service_available:
+                        try:
+                            result = await self._try_extension_generation(
+                                url=url,
+                                method="POST",
+                                json_data=json_data,
+                                at_token=at,
+                                timeout=config.upsample_timeout + 10,
+                                token_id=token_id,
+                            )
+                        except Exception as ext_err:
+                            debug_logger.log_warning(f"[EXT-GEN-UPSAMPLE] Extension proxy failed: {ext_err}")
+                            result = None
+
+                    if result is None:
+                        result = await self._make_request(
+                            method="POST",
+                            url=url,
+                            json_data=json_data,
+                            use_at=True,
+                            at_token=at,
+                            timeout=config.upsample_timeout
+                        )
+
                 return result.get("encodedImage", "")
             except Exception as e:
                 last_error = e

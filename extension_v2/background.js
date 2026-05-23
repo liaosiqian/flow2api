@@ -182,6 +182,12 @@ async function connectWS() {
             });
         }
 
+        if (data.type === "atomic_generation") {
+            generationQueue = generationQueue.then(() => handleAtomicGeneration(data)).catch(err => {
+                console.error("[Flow2API] Atomic Generation Queue Error:", err);
+            });
+        }
+
         if (data.type === "open_labs_refresh") {
             handleOpenLabsRefresh(data).catch(err => {
                 console.error("[Flow2API] OpenLabsRefresh Error:", err);
@@ -409,6 +415,140 @@ async function handleGenerationRequest(data) {
                     console.log("[Flow2API] Closed reused captcha generation tab.");
                 }
             } catch (e) {}
+        }
+    }
+}
+
+async function handleAtomicGeneration(data) {
+    const FLOW_URL = "https://labs.google/fx/tools/flow";
+    let newTabId = null;
+
+    function sendResult(payload) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ req_id: data.req_id, ...payload }));
+        }
+    }
+
+    try {
+        const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+        newTabId = tab.id;
+        await waitForTabReady(newTabId, 20000);
+        await sleep(1200);
+
+        const recaptchaAction = data.recaptcha_action || "IMAGE_GENERATION";
+        const scriptTimeoutMs = recaptchaAction === "VIDEO_GENERATION" ? 40000 : 30000;
+
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: newTabId },
+            world: "MAIN",
+            func: async (request, captchaAction, timeoutMs) => {
+                const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+
+                function loadRecaptcha() {
+                    return new Promise((resolve, reject) => {
+                        if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
+                            resolve();
+                            return;
+                        }
+                        const s = document.createElement("script");
+                        s.src = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
+                        s.onload = () => resolve();
+                        s.onerror = () => reject(new Error("Failed to load enterprise.js"));
+                        document.head.appendChild(s);
+                    });
+                }
+
+                async function getToken() {
+                    await loadRecaptcha();
+                    return new Promise((resolve, reject) => {
+                        grecaptcha.enterprise.ready(() => {
+                            grecaptcha.enterprise.execute(SITE_KEY, { action: captchaAction })
+                                .then(resolve)
+                                .catch(err => reject(new Error(err.message || "reCAPTCHA failed")));
+                        });
+                    });
+                }
+
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+                try {
+                    const token = await getToken();
+                    if (!token) throw new Error("Empty reCAPTCHA token");
+
+                    let body = request.json_data || {};
+                    if (request.token_path) {
+                        const parts = request.token_path.split(".");
+                        let obj = body;
+                        for (let i = 0; i < parts.length - 1; i++) {
+                            if (!obj[parts[i]]) obj[parts[i]] = {};
+                            obj = obj[parts[i]];
+                        }
+                        obj[parts[parts.length - 1]] = token;
+                    }
+
+                    const method = String(request.method || "POST").toUpperCase();
+                    const response = await fetch(request.url, {
+                        method,
+                        headers: request.headers || {},
+                        body: JSON.stringify(body),
+                        credentials: "include",
+                        referrer: "https://labs.google/fx/tools/flow",
+                        referrerPolicy: "strict-origin-when-cross-origin",
+                        signal: controller.signal
+                    });
+
+                    const responseText = await response.text();
+                    let responseJson = null;
+                    try { responseJson = responseText ? JSON.parse(responseText) : null; } catch (e) {}
+
+                    return {
+                        ok: response.ok,
+                        status: response.status,
+                        statusText: response.statusText,
+                        text: responseText,
+                        json: responseJson,
+                        recaptcha_token: token
+                    };
+                } finally {
+                    clearTimeout(timer);
+                }
+            },
+            args: [
+                {
+                    url: data.url,
+                    method: data.method || "POST",
+                    headers: data.headers || {},
+                    json_data: data.json_data || {},
+                    token_path: data.token_path || "clientContext.recaptchaContext.token",
+                    timeout_ms: Number(data.timeout_ms || 60000)
+                },
+                recaptchaAction,
+                scriptTimeoutMs
+            ]
+        });
+
+        const result = results && results[0] && results[0].result;
+        if (!result) {
+            sendResult({ status: "error", error: "No response from atomic generation" });
+            return;
+        }
+
+        sendResult({
+            status: "success",
+            response_status: result.status,
+            response_text: result.text || "",
+            response_json: result.json || null,
+            recaptcha_token: result.recaptcha_token || null
+        });
+    } catch (err) {
+        sendResult({
+            status: "error",
+            error: err && err.message ? err.message : String(err)
+        });
+    } finally {
+        if (newTabId) {
+            try { await chrome.tabs.remove(newTabId); } catch (e) {}
         }
     }
 }

@@ -450,3 +450,41 @@ class ExtensionCaptchaService:
             request_payload=payload,
             timeout=timeout,
         )
+
+    async def submit_atomic_generation(
+        self,
+        *,
+        url: str,
+        method: str = "POST",
+        headers: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Dict[str, Any]] = None,
+        token_path: str = "clientContext.recaptchaContext.token",
+        recaptcha_action: str = "IMAGE_GENERATION",
+        timeout: int = 60,
+        token_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Execute reCAPTCHA + API request atomically in one browser tab."""
+        if not self.active_connections:
+            raise RuntimeError("No extension connections for atomic generation")
+        route_key = await self._resolve_route_key(token_id)
+        conn = self._select_connection(route_key)
+        if conn is None:
+            available = self._describe_routes() or "none"
+            raise RuntimeError(
+                f"No extension connection for atomic generation (route_key='{route_key}'). "
+                f"Available: {available}"
+            )
+        payload = {
+            "url": str(url or "").strip(),
+            "method": str(method or "POST").strip().upper(),
+            "headers": dict(headers or {}),
+            "json_data": json_data if isinstance(json_data, dict) else {},
+            "token_path": token_path,
+            "recaptcha_action": recaptcha_action,
+        }
+        return await self._generation_request_once(
+            conn,
+            message_type="atomic_generation",
+            request_payload=payload,
+            timeout=timeout,
+        )
