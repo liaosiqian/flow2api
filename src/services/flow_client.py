@@ -1468,7 +1468,7 @@ class FlowClient:
                             token_id=token_id,
                         )
                     except Exception as ext_err:
-                        print(f"[UPSAMPLE-DEBUG] Extension w/ recaptcha failed: {ext_err}", flush=True)
+                        print(f"[UPSAMPLE-DEBUG] Extension w/ recaptcha failed: {str(ext_err)[:500]}", flush=True)
                         result = None
 
                 if result is None:
