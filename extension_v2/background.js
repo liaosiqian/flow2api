@@ -341,6 +341,57 @@ async function handleGenerationRequest(data) {
             await sleep(800);
         }
 
+        // If needs_recaptcha, solve reCAPTCHA first in the same tab
+        if (data.needs_recaptcha && data.token_path) {
+            const captchaAction = data.recaptcha_action || "IMAGE_GENERATION";
+            const tokenTimeoutMs = captchaAction === "VIDEO_GENERATION" ? 30000 : 20000;
+            const tokenResults = await chrome.scripting.executeScript({
+                target: { tabId: newTabId },
+                world: "MAIN",
+                func: async (action, timeoutMs) => {
+                    return new Promise((resolve, reject) => {
+                        let settled = false;
+                        const finish = (fn, value) => { if (settled) return; settled = true; fn(value); };
+                        try {
+                            function run() {
+                                grecaptcha.enterprise.ready(function() {
+                                    grecaptcha.enterprise.execute("6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV", { action: action })
+                                        .then(token => finish(resolve, token))
+                                        .catch(err => finish(reject, err.message || "reCAPTCHA failed"));
+                                });
+                            }
+                            if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
+                                run();
+                            } else {
+                                const s = document.createElement("script");
+                                s.src = "https://www.google.com/recaptcha/enterprise.js?render=6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+                                s.onload = run;
+                                s.onerror = () => finish(reject, "Failed to load enterprise.js");
+                                document.head.appendChild(s);
+                            }
+                            setTimeout(() => finish(reject, "Timeout getting reCAPTCHA token"), timeoutMs);
+                        } catch (e) { finish(reject, e.message); }
+                    });
+                },
+                args: [captchaAction, tokenTimeoutMs]
+            });
+            const token = tokenResults && tokenResults[0] && tokenResults[0].result;
+            if (!token) {
+                const tokenErr = tokenResults && tokenResults[0] && tokenResults[0].error;
+                sendResult({ status: "error", error: tokenErr ? (tokenErr.message || String(tokenErr)) : "reCAPTCHA failed in generation tab" });
+                return;
+            }
+            // Inject token into json_data
+            const parts = data.token_path.split(".");
+            let obj = data.json_data || {};
+            for (let i = 0; i < parts.length - 1; i++) {
+                if (!obj[parts[i]]) obj[parts[i]] = {};
+                obj = obj[parts[i]];
+            }
+            obj[parts[parts.length - 1]] = token;
+            data.json_data = data.json_data || obj;
+        }
+
         const results = await chrome.scripting.executeScript({
             target: { tabId: newTabId },
             world: "MAIN",
