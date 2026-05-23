@@ -7,7 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     ALLOW_DOCKER_HEADED_CAPTCHA=true \
     DISPLAY=:99 \
     PERSONAL_BROWSER_HEADLESS=0 \
-    PLAYWRIGHT_BROWSERS_PATH=0
+    PLAYWRIGHT_BROWSERS_PATH=0 \
+    CLOAKBROWSER_AUTO_UPDATE=false \
+    CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -24,7 +26,8 @@ RUN apt-get update \
 COPY requirements.txt ./
 
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+    && python -m playwright install --with-deps chromium \
+    && python -m cloakbrowser install
 
 COPY . .
 COPY docker/entrypoint.headed.sh /usr/local/bin/entrypoint.headed.sh

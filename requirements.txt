@@ -12,3 +12,4 @@ playwright>=1.40.0
 nodriver>=0.48.0
 prometheus-client==0.22.1
 cryptography>=42.0.0,<46.0.0
+cloakbrowser>=0.3.30
