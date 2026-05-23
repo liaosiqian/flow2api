@@ -380,7 +380,7 @@ class ExtensionCaptchaService:
             await conn.websocket.send_text(json.dumps(message))
             print(f"[EXT-GEN-DEBUG] Message sent, waiting for response...", flush=True)
             result = await asyncio.wait_for(future, timeout=safe_timeout)
-            print(f"[EXT-GEN-DEBUG] Got response: status={result.get('status') if isinstance(result, dict) else 'invalid'}", flush=True)
+            print(f"[EXT-GEN-DEBUG] Got response: status={result.get('status') if isinstance(result, dict) else 'invalid'} response_status={result.get('response_status') if isinstance(result, dict) else '?'} body_preview={str(result.get('response_text',''))[:300] if isinstance(result, dict) else ''}", flush=True)
             if not isinstance(result, dict):
                 raise RuntimeError("Invalid extension generation response format")
             if result.get("status") == "success":

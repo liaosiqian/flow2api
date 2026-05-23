@@ -775,6 +775,7 @@ class FlowClient:
                 debug_logger.log_info("[EXT-GEN] Image generation request succeeded via extension proxy")
                 return ext_result
             except Exception as ext_err:
+                print(f"[EXT-GEN] Extension proxy FAILED: {ext_err}", flush=True)
                 debug_logger.log_warning(
                     f"[EXT-GEN] Extension proxy failed, falling back to curl_cffi: {ext_err}"
                 )
