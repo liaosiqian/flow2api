@@ -51,17 +51,6 @@ class ChromeManager:
         if configured:
             return configured
 
-        # Priority 1: CloakBrowser stealth binary (reCAPTCHA v3 score ~0.9)
-        cloak_cache = Path(
-            os.environ.get("CLOAKBROWSER_CACHE_DIR", os.path.expanduser("~/.cloakbrowser"))
-        )
-        if cloak_cache.exists():
-            for chrome in sorted(cloak_cache.glob("**/chrome"), reverse=True):
-                if chrome.is_file() and os.access(str(chrome), os.X_OK):
-                    print(f"[ChromeManager] Using CloakBrowser: {chrome}")
-                    return str(chrome)
-
-        # Priority 2: System-installed Chrome
         candidates = [
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
@@ -73,7 +62,6 @@ class ChromeManager:
             if os.path.exists(path):
                 return path
 
-        # Priority 3: Playwright bundled Chromium (fallback)
         browsers_root = Path(
             os.environ.get(
                 "PLAYWRIGHT_BROWSERS_PATH",
@@ -97,32 +85,35 @@ class ChromeManager:
         chrome_binary: str,
         window_offset: int = 0,
     ) -> list:
-        """Build Chrome launch arguments."""
+        """Build Chrome launch arguments with anti-detection flags."""
         display = os.environ.get("DISPLAY", ":99")
-        is_cloakbrowser = "cloakbrowser" in chrome_binary.lower()
 
         args = [
             chrome_binary,
+
+            # Extension loading (per-instance copy with baked routeKey)
             f"--disable-extensions-except={extension_dir}",
             f"--load-extension={extension_dir}",
+
+            # User data (persistent cookies/session per token)
             f"--user-data-dir={user_data_dir}",
-        ]
 
-        # CloakBrowser handles anti-detection at C++ source level; skip for stock Chromium
-        if not is_cloakbrowser:
-            args += [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-            ]
+            # Anti-detection: NO automation markers
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
 
-        args += [
+            # Environment
             f"--display={display}",
             "--window-size=1440,900",
             f"--window-position={window_offset * 50},{window_offset * 30}",
             "--lang=en-US",
+
+            # Docker compatibility
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+
+            # Prevent first-run dialogs
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-default-apps",
@@ -130,16 +121,15 @@ class ChromeManager:
             "--disable-translate",
             "--disable-sync",
             "--disable-background-networking",
+
+            # Stability
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-hang-monitor",
+
+            # Start URL
+            ChromeManager.START_URL,
         ]
-
-        chrome_proxy = os.environ.get("CHROME_PROXY", "").strip()
-        if chrome_proxy:
-            args.append(f"--proxy-server={chrome_proxy}")
-
-        args.append(ChromeManager.START_URL)
         return args
 
     def _prepare_extension_copy(self, route_key: str, profile_dir: Path) -> Path:
